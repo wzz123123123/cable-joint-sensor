@@ -1,0 +1,202 @@
+远端服务器上报数据格式（完整说明）
+
+一、通道与外层结构
+1) 传输通道
+- 协议：Modbus TCP 长连接（承载 JSON 文本，JSON 被封装进自定义 Modbus TCP 帧 Data 段）
+- 服务器：192.168.201.203:502
+
+2) 外层 JSON 包类型
+- 节点连接状态变化：
+  {
+    "type": "node_connection_change",
+    "node_id": <int>,
+    "is_connected": <bool>,
+    "timestamp": <ISO8601 字符串>,
+    "message": "客户端已连接" | "客户端已断开"
+  }
+
+- 每分钟历史数据（主报文）：
+  {
+    "type": "minute_history_data",
+    "node_id": <int>,
+    "timestamp": <ISO8601 字符串>,
+    "sensor_data": <见第三节完整字段集合>
+  }
+
+- 故障信息（保留接口）：
+  {
+    "type": "fault_info",
+    "node_id": <int>,
+    "fault_type": <字符串>,
+    "fault_description": <字符串>,
+    "timestamp": <ISO8601 字符串>,
+    "fault_data": <对象, 可选扩展>
+  }
+
+说明：minute_history_data 的 sensor_data 为系统每分钟聚合一次的“完整数据快照+计算结果+告警文本”。
+
+
+二、核心上报：每分钟历史数据 sensor_data 字段
+A. 元信息
+- node_id: int            节点编号
+- sensor_type: int        最近一次数据来源的传感器类型（1=温湿度 2=CO 3=H2 4=压力 5=烟雾 7=PT100 8=状态）
+- timestamp: int          最近一次数据时间戳（毫秒）
+
+B. 原始传感器字段（尽量原样上报）
+- temperature: number           环境温（°C），来自温湿度传感器
+- humidity: number              湿度（%RH）
+- co_ppm: int                   一氧化碳 CO（ppm）
+- h2_percentage: number         氢气 H2（%LEL）
+- pressure_kpa: number          压力（kPa）
+- pressure_temp_c: number       压力传感器内部温度（°C）
+- smoke_status: int             烟雾状态（见下文“烟雾状态取值”）
+- smoke_external_temp_c: number 烟雾外部温度（°C）
+- smoke_channel_a: int          烟雾原始通道 A（原始计数值）
+- smoke_channel_b: int          烟雾原始通道 B（原始计数值）
+- pt100_temperatures: string    PT100 原始数组(JSON 字符串，单位° C；-999 表示开路)，最多 12 路，以下 9 路为关键：
+                                [pt1,pt2,pt3, pt4,pt5,pt6, pt7,pt8,pt9, ...]
+
+C. 计算/派生环境三温（来自 CSV 算法）
+- upper_temp: number   上温(°C)：优先使用 PT 通道9(索引9)；无效(-999/缺失)时回退到 temperature
+- middle_temp: number  中温(°C)：优先使用 PT 通道11(索引11)；无效(-999/缺失)时回退到 temperature
+- lower_temp: number   下温(°C)：优先使用 pressure_temp_c；否则回退到 temperature
+
+D. PT100 九点关键位（外三相的左/中/右）单位 °C
+- a_left:   pt[0]   a_middle: pt[1]   a_right:  pt[2]
+- b_left:   pt[3]   b_middle: pt[4]   b_right:  pt[5]
+- c_left:   pt[6]   c_middle: pt[7]   c_right:  pt[8]
+
+E. 三相“中内温”计算（单位 °C）
+- a_core, b_core, c_core
+  计算公式（与详情页一致的近似）：
+  core = x + 6.42 * max(0, x - env) + 2.5 * max(0, x - phaseAvg)
+  其中：
+  - 对 A/B/C 相，x 取各相中外温度（pt2/pt5/pt8）；phaseAvg 为各相三点均值；env 为环境参考温
+  - 环境参考优先顺序：中温、下温（在实现中优先用中温作为环境参照）
+
+F. 烟雾通道处理结果（无量纲）
+- white_smoke: number  由通道 A 映射
+- black_smoke: number  由通道 B 映射
+  分段算法：
+  - x < 1610            => 0.0
+  - 1610 < x < 2178     => -0.0000001371*x^2 + 0.001136*x - 1.473
+  - x >= 2178           => 0.6061*ln(x) - 4.308
+
+G. 数据状态与告警汇总
+- status: string     "OK" | "EMPTY" | "INVALID" | "DISCONNECTED"
+  判定逻辑：
+  - DISCONNECTED：系统未连接
+  - EMPTY：所有核心字段均为空/缺失（温度/湿度/CO/H2/压力/压力温/烟雾/外温/烟雾通道/PT100）
+  - INVALID：PT100 主 9 通道（pt1..pt9）全部为 -999（开路）
+  - OK：其它情况
+
+- warnings: string   预警文本，多个以分号分隔；无预警为“无”
+- faults:   string   故障文本，多个以分号分隔；无故障为“无”
+  文本来自 AlertService.analyzeNodeData 的规则判定（见第四节）
+
+
+三、烟雾状态取值（smoke_status）
+- 1: 正常
+- 2: 预警（任一通道 A/B 触发预警位）
+- 4: 故障（任一通道 A/B 触发故障位）
+说明：故障优先级高于预警；有故障则置 4，不再置 2。
+
+
+四、典型预警/故障规则说明（示例，不限于此）
+实际以 SettingsService 的阈值配置 + AlertService 的判定为准。
+
+1) 温度类
+- 预警：上/中/下温度或相中外温度接近/超过预警阈值（示例：温度 84.5°C 接近 85°C 预警阈）
+- 故障：超过故障阈值（示例：温度 91.0°C ≥ 90°C 故障阈）
+- 局放/不均匀升温：相中右（或左）与相中外/相平均差值过大
+
+2) 湿度类
+- 预警：湿度 ≥ 预警阈值（默认 60%RH），可伴随“持续时长”条件（如 ≥8 小时）
+- 故障：湿度 ≥ 故障阈值（默认 75%RH）且满足持续时长
+
+3) 压力类
+- 预警：pressure_kpa ≥ 预警阈值（默认 105.0 kPa）
+- 故障：pressure_kpa ≥ 故障阈值（默认 110.0 kPa）
+
+4) 氢气 H2
+- 预警：h2_percentage ≥ 预警阈值（默认 0.0 %LEL）
+- 故障：h2_percentage ≥ 故障阈值（默认 2.0 %LEL）
+
+5) 一氧化碳 CO
+- 预警：co_ppm ≥ 预警阈值（默认 0 ppm）
+- 故障：co_ppm ≥ 故障阈值（默认 50 ppm）
+
+6) 烟雾
+- 预警：通道 A 或 B 预警位触发（smoke_status=2）
+- 故障：通道 A 或 B 故障位触发（smoke_status=4）
+- 其它：white_smoke/black_smoke 为换算后的强度值，可用于趋势
+
+7) PT100
+- 故障：关键 9 通道全部 -999 判为 INVALID；单通道 -999 可能形成相应“传感器开路”故障条目
+
+注：
+- 各阈值可在 SettingsService 中按节点覆盖（温湿度/CO/H2/烟雾/压力及修正项等）
+- 三相中内温公式的系数（k1,k2）可按节点配置（默认 k1=6.42, k2=2.5）
+
+
+五、示例：完整 minute_history_data 上报包
+{
+  "type": "minute_history_data",
+  "node_id": 6,
+  "timestamp": "2025-10-30T10:12:00.123Z",
+  "sensor_data": {
+    "node_id": 6,
+    "sensor_type": 7,
+    "timestamp": 1730273520123,
+
+    "temperature": 26.3,
+    "humidity": 61.5,
+    "co_ppm": 35,
+    "h2_percentage": 0.8,
+    "pressure_kpa": 104.7,
+    "pressure_temp_c": 27.1,
+
+    "smoke_status": 2,
+    "smoke_external_temp_c": 28.4,
+    "smoke_channel_a": 1800,
+    "smoke_channel_b": 2250,
+
+    "pt100_temperatures": "[25.8,26.1,26.3,26.2,26.4,26.6,25.9,26.0,26.2,27.5,26.8,27.1]",
+
+    "upper_temp": 27.5,
+    "middle_temp": 27.1,
+    "lower_temp": 27.1,
+
+    "a_left": 25.8,   "a_middle": 26.1, "a_right": 26.3,
+    "b_left": 26.2,   "b_middle": 26.4, "b_right": 26.6,
+    "c_left": 25.9,   "c_middle": 26.0, "c_right": 26.2,
+
+    "a_core": 32.4,
+    "b_core": 33.1,
+    "c_core": 31.9,
+
+    "white_smoke": 0.25,
+    "black_smoke": 0.61,
+
+    "status": "OK",
+    "warnings": "湿度偏高:61.5%≥60%;H2预警:0.8%LEL≥0.0",
+    "faults": "无"
+  }
+}
+
+
+六、字段单位/取值要点速查
+- 温度类：°C；PT100 未接/开路为 -999（数组元素）
+- 湿度：%RH；显示可带节点修正，上报为计算后值
+- CO：ppm（整数）
+- H2：%LEL（小数）
+- 压力：kPa（小数）；压力温度为 °C
+- white_smoke/black_smoke：由 A/B 通道映射，无量纲
+- smoke_status：1=正常，2=预警，4=故障
+- status：OK/EMPTY/INVALID/DISCONNECTED
+
+
+七、扩展与对接建议
+- 建议远端以 type+node_id+timestamp 作为幂等键，避免重复入库。
+- warnings/faults 为“;”分隔的人类可读文本，亦可在后续版本扩展为结构化数组：[{code, level, message, extra}]
+- 若需要秒级粒度，可额外开放“原始帧转发”通道，用于实时监控/诊断。
