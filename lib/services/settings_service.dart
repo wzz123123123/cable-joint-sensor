@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:io';
 
 class SettingsService {
   static final SettingsService _instance = SettingsService._internal();
@@ -21,9 +21,6 @@ class SettingsService {
   static const int DEFAULT_HUMIDITY_FAULT_HOURS = 8;
   static const double DEFAULT_PRESSURE_WARNING = 105.0;
   static const double DEFAULT_PRESSURE_FAULT = 110.0;
-  static const int DEFAULT_NODE_QUERY_RETRY_COUNT = 5; // 节点查询重试次数
-  static const int DEFAULT_NODE_QUERY_INTERVAL_MS = 100; // 节点查询间隔时间（毫秒）
-  static const int DEFAULT_NODE_DISCONNECT_TIMEOUT_MS = 40000; // 节点断开连接判断超时时间（毫秒，40秒）
 
   // 当前设置
   double _tempStart = DEFAULT_TEMP_START;
@@ -40,13 +37,9 @@ class SettingsService {
   double _pressureWarning = DEFAULT_PRESSURE_WARNING;
   double _pressureFault = DEFAULT_PRESSURE_FAULT;
   
-  // 节点查询配置
-  int _nodeQueryRetryCount = DEFAULT_NODE_QUERY_RETRY_COUNT;
-  int _nodeQueryIntervalMs = DEFAULT_NODE_QUERY_INTERVAL_MS;
-  int _nodeDisconnectTimeoutMs = DEFAULT_NODE_DISCONNECT_TIMEOUT_MS;
-  
   // 湿度修正（全局默认，按节点可覆盖）
   double _humidityCorrection = 0.0;
+  double get humidityCorrection => _humidityCorrection;
   
   // PT100十路参数修正
   List<double> _pt100Corrections = List<double>.filled(10, 0.0);
@@ -78,10 +71,6 @@ class SettingsService {
   int get humidityFaultHours => _humidityFaultHours;
   double get pressureWarning => _pressureWarning;
   double get pressureFault => _pressureFault;
-  int get nodeQueryRetryCount => _nodeQueryRetryCount;
-  int get nodeQueryIntervalMs => _nodeQueryIntervalMs;
-  int get nodeDisconnectTimeoutMs => _nodeDisconnectTimeoutMs;
-  double get humidityCorrection => _humidityCorrection;
   List<double> get pt100Corrections => List.from(_pt100Corrections);
   double get upperTempCorrection => _upperTempCorrection;
   double get envTempCorrection => _envTempCorrection;
@@ -98,7 +87,7 @@ class SettingsService {
   // 初始化设置
   Future<void> initialize() async {
     final prefs = await SharedPreferences.getInstance();
-    // 如果本地首启为空（例如重装），尝试从外部备份恢复
+    // 如果是重新安装导致的 SharedPreferences 被清空，则尝试从外部存储备份恢复
     await _restorePrefsFromExternalIfEmpty(prefs);
     
     _tempStart = prefs.getDouble('temp_start') ?? DEFAULT_TEMP_START;
@@ -114,9 +103,6 @@ class SettingsService {
     _humidityFaultHours = prefs.getInt('humidity_fault_hours') ?? DEFAULT_HUMIDITY_FAULT_HOURS;
     _pressureWarning = prefs.getDouble('pressure_warning') ?? DEFAULT_PRESSURE_WARNING;
     _pressureFault = prefs.getDouble('pressure_fault') ?? DEFAULT_PRESSURE_FAULT;
-    _nodeQueryRetryCount = prefs.getInt('node_query_retry_count') ?? DEFAULT_NODE_QUERY_RETRY_COUNT;
-    _nodeQueryIntervalMs = prefs.getInt('node_query_interval_ms') ?? DEFAULT_NODE_QUERY_INTERVAL_MS;
-    _nodeDisconnectTimeoutMs = prefs.getInt('node_disconnect_timeout_ms') ?? DEFAULT_NODE_DISCONNECT_TIMEOUT_MS;
     _humidityCorrection = prefs.getDouble('humidity_correction') ?? 0.0;
     
     // 加载PT100参数修正
@@ -304,18 +290,6 @@ class SettingsService {
     await prefs.setDouble('pressure_fault', fault);
     await _backupPrefsToExternal(prefs);
   }
-  
-  // 更新节点查询配置
-  Future<void> updateNodeQueryConfig(int retryCount, int intervalMs, int disconnectTimeoutMs) async {
-    _nodeQueryRetryCount = retryCount;
-    _nodeQueryIntervalMs = intervalMs;
-    _nodeDisconnectTimeoutMs = disconnectTimeoutMs;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('node_query_retry_count', retryCount);
-    await prefs.setInt('node_query_interval_ms', intervalMs);
-    await prefs.setInt('node_disconnect_timeout_ms', disconnectTimeoutMs);
-    await _backupPrefsToExternal(prefs);
-  }
 
   // 更新湿度修正（全局）
   Future<void> updateHumidityCorrection(double correction) async {
@@ -391,9 +365,6 @@ class SettingsService {
     _humidityFaultHours = DEFAULT_HUMIDITY_FAULT_HOURS;
     _pressureWarning = DEFAULT_PRESSURE_WARNING;
     _pressureFault = DEFAULT_PRESSURE_FAULT;
-    _nodeQueryRetryCount = DEFAULT_NODE_QUERY_RETRY_COUNT;
-    _nodeQueryIntervalMs = DEFAULT_NODE_QUERY_INTERVAL_MS;
-    _nodeDisconnectTimeoutMs = DEFAULT_NODE_DISCONNECT_TIMEOUT_MS;
     _pt100Corrections = List<double>.filled(10, 0.0);
     _upperTempCorrection = 0.0;
     _envTempCorrection = 0.0;
@@ -418,9 +389,6 @@ class SettingsService {
       'humidityFaultHours': _humidityFaultHours,
       'pressureWarning': _pressureWarning,
       'pressureFault': _pressureFault,
-      'nodeQueryRetryCount': _nodeQueryRetryCount,
-      'nodeQueryIntervalMs': _nodeQueryIntervalMs,
-      'nodeDisconnectTimeoutMs': _nodeDisconnectTimeoutMs,
       'pt100Corrections': List.from(_pt100Corrections),
       'upperTempCorrection': _upperTempCorrection,
       'envTempCorrection': _envTempCorrection,
@@ -473,6 +441,7 @@ class SettingsService {
         } else if (value is String) {
           await prefs.setString(key, value);
         } else if (value is List) {
+          // SharedPreferences 不直接支持List，存储时已序列化，这里也按字符串处理
           await prefs.setString(key, jsonEncode(value));
         }
       }

@@ -11,6 +11,7 @@ import 'models/node_data.dart';
 import 'services/settings_service.dart';
 import 'services/password_service.dart';
 import 'services/csv_logger_service.dart';
+import 'services/serial_debug_logger.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +21,8 @@ void main() async {
   await PasswordService().initialize();
   // 初始化CSV日志服务
   await CsvLoggerService.instance.initialize();
+  await SerialDebugLogger.instance.initialize();
+  await SerialDebugLogger.instance.log('数据记录目录: ${CsvLoggerService.instance.displayPath}');
   runApp(const SensorApp());
 }
 

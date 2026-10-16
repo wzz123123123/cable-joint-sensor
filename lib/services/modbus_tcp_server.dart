@@ -10,6 +10,7 @@ import 'alert_service.dart';
 import 'node_data_calculator.dart';
 import 'sensor_data_service.dart';
 import 'rs485_protocol.dart';
+import 'temp_channel_filter.dart';
 import '../models/node_data.dart';
 
 /// Modbus TCP服务器，监听客户端连接，根据请求返回节点数据（485格式）
@@ -31,14 +32,11 @@ class ModbusTcpServer {
   // 缓存每个节点上一次非空的响应数据（用于未连接时返回）
   // key: nodeId, value: 上一次非空的响应数据
   final Map<int, List<int>> _lastValidResponseCache = {};
+  final Map<int, List<int>> _fullRegisterCache = {};
+  final Map<int, AlertInfo> _lastAlerts = {};
+  final Set<int> _cacheBuilding = {};
   
-  // 温度值历史记录（用于异常值过滤）
-  // key: '${nodeId}_${phase}_${channelIndex}', value: 最近的有效温度值列表
-  final Map<String, List<double>> _tempHistoryCache = {};
-  
-  // 温度值异常跳变阈值（°C）
-  static const double _tempJumpThreshold = 10.0; // 超过±10°C的变化认为是异常
-  static const double _tempMinValue = -50.0; // 最小合理温度（去掉上限）
+  final Map<String, TempChannelFilter> _tempFilters = {};
 
   /// 启动服务器
   Future<bool> start() async {
@@ -155,10 +153,6 @@ class ModbusTcpServer {
   /// 异步处理客户端数据
   Future<void> _handleClientDataAsync(Socket client, Uint8List data) async {
     try {
-      // 打印完整接收数据（十六进制）用于调试
-      final hexString = data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
-      print('🔍 收到完整数据（${data.length}字节）: $hexString');
-      
       if (data.length < 8) {
         print('⚠️ 数据长度不足: ${data.length}');
         return;
@@ -208,20 +202,14 @@ class ModbusTcpServer {
         print('⚠️ 寄存器数量超出范围，已限制: 请求数量=$quantity (0x${quantity.toRadixString(16).padLeft(4, '0')}), 实际返回=$actualQuantity (0x${actualQuantity.toRadixString(16).padLeft(4, '0')}), 最大地址=$maxAddress (0x${maxAddress.toRadixString(16).padLeft(4, '0')})');
       }
 
-      // 生成响应数据（485格式）
-      final responseData = await _generateNodeDataResponse(unitId, startAddress, actualQuantity);
-
+      var responseData = _sliceFullCache(unitId, startAddress, actualQuantity);
+      if (responseData.isEmpty) {
+        responseData = List<int>.from(_lastValidResponseCache[unitId] ?? const <int>[]);
+      }
+      unawaited(_rebuildFullCache(unitId));
       if (responseData.isEmpty) {
         print('⚠️ 无法生成节点$unitId的响应数据（起始地址=$startAddress, 数量=$actualQuantity）');
-        // 如果无法生成数据，尝试返回上一次正常的数据
-        if (_lastValidResponseCache.containsKey(unitId) && _lastValidResponseCache[unitId]!.isNotEmpty) {
-          print('📦 节点$unitId数据为空，返回上一次正常数据（缓存长度=${_lastValidResponseCache[unitId]!.length}）');
-          _sendResponse(client, transactionId, unitId, functionCode, _lastValidResponseCache[unitId]!);
-          return;
-        }
-        // 如果缓存也没有，才发送错误响应
-        print('❌ 节点$unitId无数据且无缓存，发送错误响应');
-        _sendErrorResponse(client, transactionId, unitId, functionCode, 0x02); // 非法数据地址
+        _sendErrorResponse(client, transactionId, unitId, functionCode, 0x02);
         return;
       }
 
@@ -229,6 +217,33 @@ class ModbusTcpServer {
       _sendResponse(client, transactionId, unitId, functionCode, responseData);
     } catch (e) {
       print('❌ 处理客户端数据失败: $e');
+    }
+  }
+
+  List<int> _sliceFullCache(int nodeId, int startAddress, int quantity) {
+    final full = _fullRegisterCache[nodeId];
+    if (full == null || full.length < 2) return const <int>[];
+    final from = startAddress * 2;
+    final to = (startAddress + quantity) * 2;
+    if (from < 0 || to > full.length || from >= to) return const <int>[];
+    return full.sublist(from, to);
+  }
+
+  void scheduleCacheRebuild(int nodeId) {
+    unawaited(_rebuildFullCache(nodeId));
+  }
+
+  Future<void> _rebuildFullCache(int nodeId) async {
+    if (!_cacheBuilding.add(nodeId)) return;
+    try {
+      await Future<void>.delayed(Duration.zero);
+      final bytes = await _generateNodeDataResponse(nodeId, 0, 36);
+      if (bytes.length >= 72) {
+        _fullRegisterCache[nodeId] = List<int>.from(bytes);
+      }
+    } catch (_) {
+    } finally {
+      _cacheBuilding.remove(nodeId);
     }
   }
 
@@ -320,21 +335,10 @@ class ModbusTcpServer {
         _loadSettingsToCache(nodeId);
       }
 
-      // 获取节点预警/故障状态
-      // 从快照转换为NodeData，然后分析预警/故障
-      AlertInfo? alerts;
-      try {
-        final nodeData = _snapshotToNodeData(snapshot, nodeId);
-        if (nodeData != null) {
-          final alertService = AlertService();
-          alerts = await alertService.analyzeNodeData(nodeData);
-        }
-      } catch (e) {
-        print('⚠️ 获取节点预警/故障状态失败: $e');
-        alerts = null;
-      }
+      // 请求路径不再现场分析预警，避免卡住 RS485 轮询
+      final AlertInfo? alerts = _lastAlerts[nodeId];
 
-      // 根据起始地址和数量，生成对应的Modbus TCP格式数据
+      // 根据起始地址和数量，生成对应的数据
       // 寄存器映射（统一为36个寄存器格式，与sensor_flutter67一致）：
       // A相温度（4个温度值：左外、中外、右外、中内，共7个寄存器）
       //   0x0000: A相左外温度状态（0=正常，1=预警，2=故障，3=局放值故障）
@@ -370,11 +374,31 @@ class ModbusTcpServer {
       int currentAddress = startAddress;
 
       while (currentAddress < endAddress) {
-        // 根据地址返回单个寄存器的值（状态或数值，2字节）
-        final registerValue = _getSingleRegisterValue(displayData, nodeSettings, currentAddress, nodeId, alerts);
-
+        // 根据单个寄存器地址返回对应的2字节值（Modbus TCP格式）
+        List<int> registerValue = [0, 0];
+        
+        // A相温度（0x0000-0x0006，7个寄存器）
+        if (currentAddress >= 0x0000 && currentAddress <= 0x0006) {
+          registerValue = _getPhaseTempRegisterValue89(displayData, nodeSettings, nodeId, alerts, 'A', currentAddress - 0x0000);
+        }
+        // B相温度（0x0007-0x000D，7个寄存器）
+        else if (currentAddress >= 0x0007 && currentAddress <= 0x000D) {
+          registerValue = _getPhaseTempRegisterValue89(displayData, nodeSettings, nodeId, alerts, 'B', currentAddress - 0x0007);
+        }
+        // C相温度（0x000E-0x0014，7个寄存器）
+        else if (currentAddress >= 0x000E && currentAddress <= 0x0014) {
+          registerValue = _getPhaseTempRegisterValue89(displayData, nodeSettings, nodeId, alerts, 'C', currentAddress - 0x000E);
+        }
+        // 环境参数（0x0015-0x001B，7个寄存器）
+        else if (currentAddress >= 0x0015 && currentAddress <= 0x001B) {
+          registerValue = _getEnvironmentRegisterValue89(displayData, nodeSettings, alerts, currentAddress - 0x0015, nodeId);
+        }
+        // 烟雾和气体（0x001C-0x0023，8个寄存器）
+        else if (currentAddress >= 0x001C && currentAddress <= 0x0023) {
+          registerValue = _getSmokeAndGasRegisterValue89(displayData, nodeSettings, alerts, currentAddress - 0x001C);
+        }
+        
         // Modbus TCP格式：直接添加寄存器值（2字节，高字节在前）
-        // registerValue已经是2字节数据，直接添加
         response.addAll(registerValue);
         
         currentAddress += 1; // 每次处理1个寄存器
@@ -398,63 +422,18 @@ class ModbusTcpServer {
     }
   }
 
-  /// 获取单个寄存器的值（状态或数值）
-  /// 返回2字节数据（高字节在前）
-  /// 统一为36个寄存器格式（与sensor_flutter67一致）
-  List<int> _getSingleRegisterValue(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, int address, int nodeId, AlertInfo? alerts) {
+  /// 获取相温度数据（A/B/C相，只传输页面显示的4个温度值：左外、中外、右外、中内）
+  List<int> _getPhaseTemperatureData(dynamic snapshot, Map<String, dynamic> nodeSettings, int address, int nodeId, AlertInfo? alerts, String phase) {
     final data = <int>[];
-    
-    try {
-      // A相温度（0x0000-0x0006，7个寄存器）
-      if (address >= 0x0000 && address <= 0x0006) {
-        return _getPhaseTempRegisterValue5(displayData, nodeSettings, nodeId, alerts, 'A', address - 0x0000);
-      }
-      // B相温度（0x0007-0x000D，7个寄存器）
-      else if (address >= 0x0007 && address <= 0x000D) {
-        return _getPhaseTempRegisterValue5(displayData, nodeSettings, nodeId, alerts, 'B', address - 0x0007);
-      }
-      // C相温度（0x000E-0x0014，7个寄存器）
-      else if (address >= 0x000E && address <= 0x0014) {
-        return _getPhaseTempRegisterValue5(displayData, nodeSettings, nodeId, alerts, 'C', address - 0x000E);
-      }
-      // 环境参数（0x0015-0x001B，7个寄存器）
-      else if (address >= 0x0015 && address <= 0x001B) {
-        return _getEnvironmentRegisterValue5(displayData, nodeSettings, alerts, address - 0x0015, nodeId);
-      }
-      // 烟雾和气体（0x001C-0x0023，8个寄存器）
-      else if (address >= 0x001C && address <= 0x0023) {
-        return _getSmokeAndGasRegisterValue5(displayData, nodeSettings, alerts, address - 0x001C);
-      }
-      // 超出范围，返回0
-      else {
-        data.add(0);
-        data.add(0);
-        return data;
-      }
-    } catch (e) {
-      print('❌ 获取寄存器值失败: $e');
-      return [0, 0];
-    }
-  }
 
-  /// 获取相温度单个寄存器（状态或数值）
-  /// offset: 相对于相起始地址的偏移（0-7，对应4个温度值的状态和数值）
-  /// isStatus: true=状态寄存器（开关量），false=数值寄存器（模拟量）
-  List<int> _getPhaseTempRegister(dynamic snapshot, Map<String, dynamic> nodeSettings, int nodeId, AlertInfo? alerts, String phase, int offset, bool isStatus) {
-    final data = <int>[];
-    
     try {
       if (snapshot.pt100Temperatures == null) {
-        data.add(0);
-        data.add(0);
-        return data;
+        return List.filled(14, 0); // 返回14个0（4个温度值：左外4字节+中外2字节+右外4字节+中内4字节=14字节，中外跳过状态）
       }
 
       final temps = jsonDecode(snapshot.pt100Temperatures!) as List;
       if (temps.length < 9) {
-        data.add(0);
-        data.add(0);
-        return data;
+        return List.filled(14, 0); // 返回14个0（4个温度值：左外4字节+中外2字节+右外4字节+中内4字节=14字节，中外跳过状态）
       }
 
       final pt100Corrections = nodeSettings['pt100Corrections'] as List<dynamic>? ?? List.filled(10, 0.0);
@@ -492,12 +471,15 @@ class ModbusTcpServer {
       int phaseOffset;
       double envTemp;
       if (phase == 'A') {
+        // A相
         phaseOffset = 0;
         envTemp = upperTemp;
       } else if (phase == 'B') {
+        // B相
         phaseOffset = 3;
         envTemp = middleTemp;
       } else {
+        // C相
         phaseOffset = 6;
         envTemp = lowerTemp;
       }
@@ -508,7 +490,9 @@ class ModbusTcpServer {
       final aR = corrected[phaseOffset + 2];
 
       // 计算三相平均值（用于内温度计算）
+      final leftAvg = (corrected[0] + corrected[3] + corrected[6]) / 3;
       final middleAvg = (corrected[1] + corrected[4] + corrected[7]) / 3;
+      final rightAvg = (corrected[2] + corrected[5] + corrected[8]) / 3;
 
       // 获取K1、K2参数
       final k1 = phaseOffset == 0
@@ -531,44 +515,26 @@ class ModbusTcpServer {
         return xi + k1 * deltaEnv + k2 * deltaPhaseAvg;
       }
 
+      // 根据位置使用不同的平均值
+      final aLInner = _calculateInnerTemp(aL, envTemp, leftAvg, k1, k2);
       final aMInner = _calculateInnerTemp(aM, envTemp, middleAvg, k1, k2);
+      final aRInner = _calculateInnerTemp(aR, envTemp, rightAvg, k1, k2);
 
-      // 获取4个温度值：左外、中外、右外、中内
+      // 获取该相的温度状态
+      final phaseStatus = _getPhaseTemperatureStatus(alerts, phase);
+      
+      // 只传输页面显示的4个温度值：左外、中外、右外、中内（不传输左内和右内）
       final tempsList = [aL, aM, aR, aMInner]; // [左外, 中外, 右外, 中内]
-      
-      // 确定是哪个温度值（offset/2）
-      final tempIndex = offset ~/ 2;
-      if (tempIndex >= tempsList.length) {
-        data.add(0);
-        data.add(0);
-        return data;
-      }
-      
-      final temp = tempsList[tempIndex];
-      
-      if (isStatus) {
-        // 跳过中外温度的状态寄存器（tempIndex=1对应中外温度）
-        if (tempIndex == 1) {
-          // 中外温度状态：返回0（不发送状态）
-          data.add(0);
-          data.add(0);
-          return data;
+      for (int i = 0; i < tempsList.length; i++) {
+        final temp = tempsList[i];
+        // 跳过中外温度的状态（i=1对应中外温度）
+        if (i != 1) {
+          // 先添加状态（2字节，高字节在前）
+          data.add((phaseStatus >> 8) & 0xFF);
+          data.add(phaseStatus & 0xFF);
         }
-        // 状态寄存器：0=正常，1=预警，2=故障
-        // 检查是否有局放值故障（单独处理）
-        final hasPartialDischarge = _hasPartialDischargeFault(alerts, phase, tempIndex);
-        if (hasPartialDischarge) {
-          // 局放值故障：返回3（额外状态）
-          data.add(0);
-          data.add(3);
-        } else {
-          // 常规状态：0=正常，1=预警，2=故障
-          final statusValue = _getSimpleStatusValue(alerts, phase);
-          data.add(0); // 高字节为0
-          data.add(statusValue); // 低字节为状态值（0=正常，1=预警，2=故障）
-        }
-      } else {
-        // 数值寄存器（模拟量：2字节，高字节在前，单位0.01°C）
+        
+        // 再添加温度值（2字节，高字节在前，除以0.01）
         int raw;
         if (temp == -999.0) {
           raw = 0x8066; // 开路标记
@@ -582,17 +548,17 @@ class ModbusTcpServer {
 
       return data;
     } catch (e) {
-      print('❌ 获取相温度寄存器失败: $e');
-      return [0, 0];
+      print('❌ 获取相温度数据失败: $e');
+      return List.filled(14, 0); // 返回14个0（4个温度值：左外4字节+中外2字节+右外4字节+中内4字节=14字节，中外跳过状态）
     }
   }
 
-  /// 获取环境参数单个寄存器（状态或数值）
-  /// offset: 相对于环境参数起始地址的偏移（0-9，对应5个参数的状态和数值）
-  /// isStatus: true=状态寄存器（开关量），false=数值寄存器（模拟量）
-  List<int> _getEnvironmentRegister(dynamic snapshot, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset, bool isStatus) {
+  /// 获取环境参数数据
+  /// 上/中/下温度：只有数据值(2字节)，跳过状态
+  /// 湿度/压力：状态(2字节) + 数据值(2字节) = 4字节
+  List<int> _getEnvironmentData(dynamic snapshot, Map<String, dynamic> nodeSettings, int address, AlertInfo? alerts) {
     final data = <int>[];
-    
+
     try {
       final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
       final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
@@ -605,18 +571,12 @@ class ModbusTcpServer {
       double correctedHumidity = ((snapshot.humidity ?? 0) + humidityCorr).clamp(0, 100);
       final pressure = snapshot.pressureKpa ?? 0;
 
-      // 确定是哪个参数（offset/2）
-      final paramIndex = offset ~/ 2;
-      if (paramIndex >= 5) {
-        data.add(0);
-        data.add(0);
-        return data;
-      }
-      
+      // 根据地址返回对应的数据和状态（只传输页面显示的参数：上温度、中温度、下温度、湿度、压力）
+      final offset = (address - 0x0030) ~/ 2; // 每个参数占2个寄存器
       double value = 0;
       int status = 0;
-      
-      switch (paramIndex) {
+
+      switch (offset) {
         case 0: // 上温度
           value = upperTemp;
           status = _getPhaseTemperatureStatus(alerts, 'A'); // 上温度对应A相状态
@@ -642,38 +602,30 @@ class ModbusTcpServer {
           status = 0;
       }
 
-      if (isStatus) {
-        // 跳过上/中/下温度的状态寄存器（paramIndex=0,1,2对应上/中/下温度）
-        if (paramIndex == 0 || paramIndex == 1 || paramIndex == 2) {
-          // 上/中/下温度状态：返回0（不发送状态）
-          data.add(0);
-          data.add(0);
-          return data;
-        }
-        // 状态寄存器：0=正常，1=预警，2=故障
-        final statusValue = _getSimpleStatusFromFaultCode(status);
-        data.add(0); // 高字节为0
-        data.add(statusValue); // 低字节为状态值（0=正常，1=预警，2=故障）
-      } else {
-        // 数值寄存器（模拟量：2字节，高字节在前）
-        final raw = (value * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+      // 跳过上/中/下温度的状态（offset=0,1,2对应上/中/下温度）
+      if (offset != 0 && offset != 1 && offset != 2) {
+        // 先添加状态（2字节，高字节在前）
+        data.add((status >> 8) & 0xFF);
+        data.add(status & 0xFF);
       }
+      
+      // 再添加数据值（2字节，高字节在前，乘以100）
+      final raw = (value * 100).round();
+      data.add((raw >> 8) & 0xFF);
+      data.add(raw & 0xFF);
 
       return data;
     } catch (e) {
-      print('❌ 获取环境参数寄存器失败: $e');
-      return [0, 0];
+      print('❌ 获取环境参数数据失败: $e');
+      return [0, 0, 0, 0];
     }
   }
 
-  /// 获取烟雾和气体单个寄存器（状态或数值）
-  /// offset: 相对于烟雾和气体起始地址的偏移（0-7，对应4个参数的状态和数值）
-  /// isStatus: true=状态寄存器（开关量），false=数值寄存器（模拟量）
-  List<int> _getSmokeAndGasRegister(dynamic snapshot, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset, bool isStatus) {
+  /// 获取烟雾和气体数据（白烟、黑烟、H2、CO）
+  /// 每个参数格式：状态(2字节) + 数据值(2字节) = 4字节
+  List<int> _getSmokeAndGasData(dynamic snapshot, Map<String, dynamic> nodeSettings, int address, AlertInfo? alerts) {
     final data = <int>[];
-    
+
     try {
       // 计算烟雾浓度
       double _naturalLog(double x) {
@@ -703,93 +655,103 @@ class ModbusTcpServer {
         return m < 0 ? 0 : m;
       }
 
-      // 确定是哪个参数（offset/2）
-      final paramIndex = offset ~/ 2;
-      if (paramIndex >= 4) {
-        data.add(0);
-        data.add(0);
-        return data;
-      }
-      
+      final offset = (address - 0x003C) ~/ 2; // 每个参数占2个寄存器
       double value = 0;
       int status = 0;
-      
-      switch (paramIndex) {
-        case 0: // 白烟
+
+      switch (offset) {
+        case 0: // 白烟浓度
           status = _getSensorStatusValue(alerts, 'SMOKE');
           if (snapshot.smokeChannelA != null) {
             final aA = (snapshot.smokeCalibA ?? 0).toDouble();
             final tA = (snapshot.smokeThreshA ?? 568).toDouble();
             value = _calculateSmokeConcentration(snapshot.smokeChannelA!.toDouble(), aA, tA);
           }
+          // 先添加状态（2字节，高字节在前）
+          data.add((status >> 8) & 0xFF);
+          data.add(status & 0xFF);
+          // 再添加数据值（2字节，高字节在前，乘以1000）
+          final whiteSmokeRaw = (value * 1000).round().clamp(0, 65535);
+          data.add((whiteSmokeRaw >> 8) & 0xFF);
+          data.add(whiteSmokeRaw & 0xFF);
           break;
-        case 1: // 黑烟
+        case 1: // 黑烟浓度
           status = _getSensorStatusValue(alerts, 'SMOKE');
           if (snapshot.smokeChannelB != null) {
             final aB = (snapshot.smokeCalibB ?? 0).toDouble();
             final tB = (snapshot.smokeThreshB ?? 568).toDouble();
             value = _calculateSmokeConcentration(snapshot.smokeChannelB!.toDouble(), aB, tB);
           }
+          // 先添加状态（2字节，高字节在前）
+          data.add((status >> 8) & 0xFF);
+          data.add(status & 0xFF);
+          // 再添加数据值（2字节，高字节在前，乘以1000）
+          final blackSmokeRaw = (value * 1000).round().clamp(0, 65535);
+          data.add((blackSmokeRaw >> 8) & 0xFF);
+          data.add(blackSmokeRaw & 0xFF);
           break;
-        case 2: // H2
+        case 2: // H2浓度
           status = _getSensorStatusValue(alerts, 'H2');
-          value = snapshot.h2Percentage?.toDouble() ?? 0;
+          final h2 = snapshot.h2Percentage?.round() ?? 0;
+          // 先添加状态（2字节，高字节在前）
+          data.add((status >> 8) & 0xFF);
+          data.add(status & 0xFF);
+          // 再添加数据值（2字节，高字节在前，H2百分比值）
+          data.add(h2.clamp(0, 255));
+          data.add(0); // 填充字节
           break;
-        case 3: // CO
+        case 3: // CO浓度
           status = _getSensorStatusValue(alerts, 'CO');
           final rawCo = snapshot.coPpm?.toDouble() ?? 0;
-          value = (rawCo < 0 || rawCo > 10000) ? 0 : rawCo;
+          final coConcentration = (rawCo < 0 || rawCo > 10000) ? 0 : rawCo;
+          // 先添加状态（2字节，高字节在前）
+          data.add((status >> 8) & 0xFF);
+          data.add(status & 0xFF);
+          // 再添加数据值（2字节，高字节在前，ppm值）
+          final coRaw = coConcentration.round();
+          data.add((coRaw >> 8) & 0xFF);
+          data.add(coRaw & 0xFF);
           break;
         default:
-          value = 0;
-          status = 0;
-      }
-
-      if (isStatus) {
-        // 状态寄存器：0=正常，1=预警，2=故障
-        final statusValue = _getSimpleStatusFromFaultCode(status);
-        data.add(0); // 高字节为0
-        data.add(statusValue); // 低字节为状态值（0=正常，1=预警，2=故障）
-      } else {
-        // 数值寄存器（模拟量：2字节，高字节在前）
-        int raw;
-        if (paramIndex == 0 || paramIndex == 1) {
-          // 白烟或黑烟：乘以1000
-          raw = (value * 1000).round().clamp(0, 65535);
-        } else if (paramIndex == 2) {
-          // H2：百分比值（1字节）
-          raw = value.round().clamp(0, 255);
-        } else {
-          // CO：ppm值
-          raw = value.round();
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+          data.add(0);
+          data.add(0);
+          data.add(0);
+          data.add(0);
       }
 
       return data;
     } catch (e) {
-      print('❌ 获取烟雾和气体寄存器失败: $e');
-      return [0, 0];
+      print('❌ 获取烟雾和气体数据失败: $e');
+      return [0, 0, 0, 0];
     }
   }
 
   /// 获取烟雾比值和外部温度
-  List<int> _getSmokeRatioAndExtTemp(dynamic snapshot, Map<String, dynamic> nodeSettings, int address) {
+  /// 每个参数格式：状态(2字节) + 数据值(2字节) = 4字节
+  List<int> _getSmokeRatioAndExtTemp(dynamic snapshot, Map<String, dynamic> nodeSettings, int address, AlertInfo? alerts) {
     final data = <int>[];
 
     try {
-      final offset = address - 0x0042;
+      final offset = (address - 0x005C) ~/ 2; // 每个参数占2个寄存器
+      int status = _getSensorStatusValue(alerts, 'SMOKE'); // 烟雾比值和外部温度都使用烟雾状态
 
       if (offset == 0) {
-        // 烟雾比值（1字节）
+        // 烟雾比值
         // SensorData中没有smokeRatio字段，使用默认值0
         final ratio = 0;
+        // 先添加状态（2字节，高字节在前）
+        data.add((status >> 8) & 0xFF);
+        data.add(status & 0xFF);
+        // 再添加数据值（2字节，高字节在前）
         data.add(ratio.clamp(0, 255));
         data.add(0); // 填充字节
       } else if (offset == 1) {
-        // 外部温度（2字节，低字节在前，乘以100）
+        // 外部温度
         final extTemp = snapshot.smokeExternalTempC ?? 0;
+        // 先添加状态（2字节，高字节在前）
+        data.add((status >> 8) & 0xFF);
+        data.add(status & 0xFF);
+        // 再添加数据值（2字节，低字节在前，乘以100）
         final extTempRaw = (extTemp * 100).round().clamp(-32768, 32767);
         final signedExtTempRaw = extTempRaw < 0 ? (extTempRaw + 65536) : extTempRaw;
         data.add(signedExtTempRaw & 0xFF);
@@ -799,50 +761,7 @@ class ModbusTcpServer {
       return data;
     } catch (e) {
       print('❌ 获取烟雾比值和外部温度失败: $e');
-      return [0, 0];
-    }
-  }
-
-  /// 获取温度状态（正常=0, 预警=1, 故障1=2, 故障2=3）
-  List<int> _getTemperatureStatus(AlertInfo? alerts, int address) {
-    final data = <int>[];
-
-    try {
-      // 确定是哪个相
-      int phaseIndex;
-      if (address >= 0x0044 && address < 0x0046) {
-        phaseIndex = 0; // A相
-      } else if (address >= 0x0046 && address < 0x0048) {
-        phaseIndex = 1; // B相
-      } else {
-        phaseIndex = 2; // C相
-      }
-
-      // 从预警/故障信息中提取温度相关状态
-      int status = 0; // 默认正常
-
-      if (alerts != null) {
-        // 检查是否有温度预警
-        final hasTempWarning = alerts.warnings.any((w) => w.contains('温度预警'));
-        // 检查是否有温度故障
-        final tempFaults = alerts.faults.where((f) => f.contains('温度故障')).toList();
-
-        if (tempFaults.isNotEmpty) {
-          // 有故障，根据故障数量确定故障级别
-          status = tempFaults.length >= 2 ? 3 : 2; // 故障2或故障1
-        } else if (hasTempWarning) {
-          status = 1; // 预警
-        }
-      }
-
-      // 返回2字节状态（高字节在前）
-      data.add((status >> 8) & 0xFF);
-      data.add(status & 0xFF);
-
-      return data;
-    } catch (e) {
-      print('❌ 获取温度状态失败: $e');
-      return [0, 0];
+      return [0, 0, 0, 0];
     }
   }
 
@@ -959,82 +878,6 @@ class ModbusTcpServer {
     return 0; // 正常
   }
 
-  /// 将故障码转换为简单状态值：0=正常，1=预警，2=故障
-  /// 故障码范围：0xE0-0xEF为预警，0xF0-0xFF为故障
-  int _getSimpleStatusFromFaultCode(int faultCode) {
-    if (faultCode == 0) return 0; // 正常
-    if (faultCode >= 0xE0 && faultCode < 0xF0) return 1; // 预警
-    if (faultCode >= 0xF0) return 2; // 故障
-    return 0; // 默认正常
-  }
-
-  /// 获取相温度的简单状态值：0=正常，1=预警，2=故障（不包括局放值故障）
-  int _getSimpleStatusValue(AlertInfo? alerts, String phase) {
-    if (alerts == null) return 0; // 正常
-
-    // 查找该相相关的预警和故障（排除局放值故障）
-    final phaseWarnings = alerts.warnings.where((w) => 
-      w.contains('${phase}相') && !w.contains('局放值高')
-    ).toList();
-    final phaseFaults = alerts.faults.where((f) => 
-      f.contains('${phase}相') && !f.contains('局放值高')
-    ).toList();
-    
-    // 优先返回故障（故障优先级高于预警）
-    if (phaseFaults.isNotEmpty) {
-      return 2; // 故障
-    }
-    
-    // 返回预警
-    if (phaseWarnings.isNotEmpty) {
-      return 1; // 预警
-    }
-    
-    // 如果没有该相的具体预警/故障，检查是否有通用的温度预警/故障（排除局放值）
-    final tempFaults = alerts.faults.where((f) => 
-      f.contains('温度故障') && !f.contains('局放值高')
-    ).toList();
-    if (tempFaults.isNotEmpty) {
-      return 2; // 故障
-    }
-    
-    final tempWarnings = alerts.warnings.where((w) => 
-      w.contains('温度预警') && !w.contains('局放值高')
-    ).toList();
-    if (tempWarnings.isNotEmpty) {
-      return 1; // 预警
-    }
-    
-    return 0; // 正常
-  }
-
-  /// 检查是否有局放值故障（针对特定相和温度索引）
-  bool _hasPartialDischargeFault(AlertInfo? alerts, String phase, int tempIndex) {
-    if (alerts == null) return false;
-    
-    // tempIndex: 0=左外，1=中外，2=右外，3=中内
-    // 局放值故障只影响左外和右外（tempIndex 0和2）
-    if (tempIndex != 0 && tempIndex != 2) return false;
-    
-    // 查找该相的局放值故障
-    final partialDischargeFaults = alerts.faults.where((f) => 
-      f.contains('${phase}相') && f.contains('局放值高')
-    ).toList();
-    
-    if (partialDischargeFaults.isEmpty) return false;
-    
-    // 检查是左外还是右外
-    if (tempIndex == 0) {
-      // 左外
-      return partialDischargeFaults.any((f) => f.contains('左外'));
-    } else if (tempIndex == 2) {
-      // 右外
-      return partialDischargeFaults.any((f) => f.contains('右外'));
-    }
-    
-    return false;
-  }
-
   /// 发送Modbus TCP响应
   void _sendResponse(Socket client, int transactionId, int unitId, int functionCode, List<int> data) {
     try {
@@ -1111,6 +954,41 @@ class ModbusTcpServer {
   /// 获取当前连接的客户端数量
   int get clientCount => _clients.length;
 
+  /// 将快照转换为NodeData
+  NodeData? _snapshotToNodeData(dynamic snapshot, int nodeId) {
+    try {
+      return NodeData(
+        nodeId: nodeId,
+        temperature: snapshot.temperature,
+        humidity: snapshot.humidity,
+        coPpm: snapshot.coPpm,
+        h2Percentage: snapshot.h2Percentage,
+        pressureKpa: snapshot.pressureKpa,
+        pressureTempC: snapshot.pressureTempC,
+        smokeAlarm: snapshot.smokeStatus == 1,
+        smokeRatio: null, // SensorData中没有smokeRatio字段，设置为null
+        smokeAlarmCount: snapshot.smokeStatus,
+        smokeExternalTempC: snapshot.smokeExternalTempC,
+        smokeChannelA: snapshot.smokeChannelA,
+        smokeChannelB: snapshot.smokeChannelB,
+        pt100Temperatures: snapshot.pt100Temperatures != null 
+            ? (jsonDecode(snapshot.pt100Temperatures!) as List).cast<num>().map((e) => e.toDouble()).toList()
+            : null,
+        lastUpdate: DateTime.now().toIso8601String(),
+        lastUpdateTimestamp: DateTime.now().millisecondsSinceEpoch,
+        stCoLen: snapshot.coPpm != null ? 1 : 0,
+        stSmokeLen: (snapshot.smokeChannelA != null || snapshot.smokeChannelB != null) ? 1 : 0,
+        stH2Len: snapshot.h2Percentage != null ? 1 : 0,
+        stPt100Len: snapshot.pt100Temperatures != null ? 1 : 0,
+        stThLen: (snapshot.temperature != null || snapshot.humidity != null) ? 1 : 0,
+        stPressureLen: snapshot.pressureKpa != null ? 1 : 0,
+      );
+    } catch (e) {
+      print('❌ 转换快照为NodeData失败: $e');
+      return null;
+    }
+  }
+
   /// 将快照转换为SensorData（用于NodeDataCalculator）
   SensorData? _snapshotToSensorData(dynamic snapshot, int nodeId) {
     try {
@@ -1148,51 +1026,20 @@ class ModbusTcpServer {
     }
   }
 
-  /// 将快照转换为NodeData
-  NodeData? _snapshotToNodeData(dynamic snapshot, int nodeId) {
-    try {
-      return NodeData(
-        nodeId: nodeId,
-        temperature: snapshot.temperature,
-        humidity: snapshot.humidity,
-        coPpm: snapshot.coPpm,
-        h2Percentage: snapshot.h2Percentage,
-        pressureKpa: snapshot.pressureKpa,
-        pressureTempC: snapshot.pressureTempC,
-        smokeAlarm: snapshot.smokeStatus == 1,
-        smokeRatio: null, // SensorData中没有smokeRatio字段，设置为null
-        smokeAlarmCount: snapshot.smokeStatus,
-        smokeExternalTempC: snapshot.smokeExternalTempC,
-        smokeChannelA: snapshot.smokeChannelA,
-        smokeChannelB: snapshot.smokeChannelB,
-        pt100Temperatures: snapshot.pt100Temperatures != null 
-            ? (jsonDecode(snapshot.pt100Temperatures!) as List).cast<num>().map((e) => e.toDouble()).toList()
-            : null,
-        lastUpdate: DateTime.now().toIso8601String(),
-        lastUpdateTimestamp: DateTime.now().millisecondsSinceEpoch,
-        stCoLen: snapshot.coPpm != null ? 1 : 0,
-        stSmokeLen: (snapshot.smokeChannelA != null || snapshot.smokeChannelB != null) ? 1 : 0,
-        stH2Len: snapshot.h2Percentage != null ? 1 : 0,
-        stPt100Len: snapshot.pt100Temperatures != null ? 1 : 0,
-        stThLen: (snapshot.temperature != null || snapshot.humidity != null) ? 1 : 0,
-        stPressureLen: snapshot.pressureKpa != null ? 1 : 0,
-      );
-    } catch (e) {
-      print('❌ 转换快照为NodeData失败: $e');
-      return null;
-    }
-  }
-
-  /// 获取相温度单个寄存器的值（sensor_flutter5专用，使用与页面显示一致的数据）
-  /// offset: 相对于相起始地址的偏移（0-6）
+  /// 获取相温度单个寄存器的值（sensor_flutter89专用，使用与页面显示一致的数据）
+  /// offset: 相对于相起始地址的偏移（0-7）
   /// 寄存器映射：0=左外状态, 1=左外值, 2=中外值, 3=右外状态, 4=右外值, 5=中内状态, 6=中内值
-  List<int> _getPhaseTempRegisterValue5(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, int nodeId, AlertInfo? alerts, String phase, int offset) {
+  List<int> _getPhaseTempRegisterValue89(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, int nodeId, AlertInfo? alerts, String phase, int offset) {
     final data = <int>[];
     
     try {
       // 从displayData获取相温度数据（与页面显示完全一致）
       final phaseTemps = displayData['phase$phase'] as List<double>?;
       if (phaseTemps == null || phaseTemps.length < 4) {
+        if (offset == 1 || offset == 2 || offset == 4 || offset == 6) {
+          final ch = offset == 1 ? 0 : offset == 2 ? 1 : offset == 4 ? 2 : 3;
+          return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, ch, -999.0));
+        }
         return [0, 0];
       }
 
@@ -1217,61 +1064,21 @@ class ModbusTcpServer {
         data.add(0); // 高字节为0
         data.add(statusLeft); // 低字节为状态值
       } else if (offset == 1) {
-        // 左外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 0, leftOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 0, leftOuter));
       } else if (offset == 2) {
-        // 中外温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 1, middleOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 1, middleOuter));
       } else if (offset == 3) {
         // 右外温度状态（转换为简单状态值：0=正常，1=预警，2=故障，3=局放值故障）
         data.add(0); // 高字节为0
         data.add(statusRight); // 低字节为状态值
       } else if (offset == 4) {
-        // 右外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 2, rightOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 2, rightOuter));
       } else if (offset == 5) {
         // 中内温度状态（转换为简单状态值：0=正常，1=预警，2=故障）
         data.add(0); // 高字节为0
         data.add(statusInner); // 低字节为状态值
       } else if (offset == 6) {
-        // 中内温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 3, middleInner);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 3, middleInner));
       } else {
         data.add(0);
         data.add(0);
@@ -1284,257 +1091,34 @@ class ModbusTcpServer {
     }
   }
 
-  /// 获取相温度单个寄存器的值（统一为36寄存器格式）- 旧方法保留用于兼容
-  /// offset: 相对于相起始地址的偏移（0-6）
-  /// 寄存器映射：0=左外状态, 1=左外值, 2=中外值, 3=右外状态, 4=右外值, 5=中内状态, 6=中内值
-  List<int> _getPhaseTempRegister5(dynamic snapshot, Map<String, dynamic> nodeSettings, int nodeId, AlertInfo? alerts, String phase, int offset) {
-    final data = <int>[];
-    
-    try {
-      if (snapshot.pt100Temperatures == null) {
-        return [0, 0];
-      }
-
-      final temps = jsonDecode(snapshot.pt100Temperatures!) as List;
-      if (temps.length < 9) {
-        return [0, 0];
-      }
-
-      final pt100Corrections = nodeSettings['pt100Corrections'] as List<dynamic>? ?? List.filled(10, 0.0);
-      final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
-      final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
-      final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
-
-      // 应用误差修正
-      final corrected = List<double>.generate(
-        temps.length,
-        (i) {
-          final base = temps[i] as double;
-          if (base == -999) return -999;
-          final delta = i < pt100Corrections.length ? (pt100Corrections[i] as double? ?? 0.0) : 0.0;
-          return base + delta;
-        },
-      );
-
-      // 更新上中下温度
-      double upperTemp = (snapshot.temperature ?? 25) + upperCorr;
-      double middleTemp = (snapshot.temperature ?? 25) + middleCorr;
-      double lowerTemp = (snapshot.temperature ?? 25) + lowerCorr;
-
-      if (nodeId == 1 && corrected.length >= 11) {
-        upperTemp = corrected[10] + upperCorr;
-      } else if (corrected.length >= 10) {
-        upperTemp = corrected[9] + upperCorr;
-      }
-
-      if (corrected.length >= 12 && corrected[11] != -999) {
-        middleTemp = corrected[11] + middleCorr;
-      }
-
-      // 根据phase参数确定是哪个相
-      int phaseOffset;
-      double envTemp;
-      if (phase == 'A') {
-        phaseOffset = 0;
-        envTemp = upperTemp;
-      } else if (phase == 'B') {
-        phaseOffset = 3;
-        envTemp = middleTemp;
-      } else {
-        phaseOffset = 6;
-        envTemp = lowerTemp;
-      }
-
-      // 获取该相的3个外温度值（左外、中外、右外）
-      final aL = corrected[phaseOffset + 0];
-      final aM = corrected[phaseOffset + 1];
-      final aR = corrected[phaseOffset + 2];
-
-      // 计算三相平均值（用于内温度计算）
-      final leftAvg = (corrected[0] + corrected[3] + corrected[6]) / 3;
-      final middleAvg = (corrected[1] + corrected[4] + corrected[7]) / 3;
-      final rightAvg = (corrected[2] + corrected[5] + corrected[8]) / 3;
-
-      // 获取K1、K2参数
-      final k1 = phaseOffset == 0
-          ? (nodeSettings['aK1'] as double? ?? 6.42)
-          : phaseOffset == 3
-              ? (nodeSettings['bK1'] as double? ?? 6.42)
-              : (nodeSettings['cK1'] as double? ?? 6.42);
-      final k2 = phaseOffset == 0
-          ? (nodeSettings['aK2'] as double? ?? 2.5)
-          : phaseOffset == 3
-              ? (nodeSettings['bK2'] as double? ?? 2.5)
-              : (nodeSettings['cK2'] as double? ?? 2.5);
-
-      // 计算内温度
-      double _calculateInnerTemp(double xi, double x0i, double xia, double k1, double k2) {
-        if (xi == -999) return -999;
-        if (xi < x0i) return xi;
-        final deltaEnv = (xi - x0i) < 0 ? 0 : (xi - x0i);
-        final deltaPhaseAvg = (xi - xia) < 0 ? 0 : (xi - xia);
-        return xi + k1 * deltaEnv + k2 * deltaPhaseAvg;
-      }
-
-      final aLInner = _calculateInnerTemp(aL, envTemp, leftAvg, k1, k2);
-      final aMInner = _calculateInnerTemp(aM, envTemp, middleAvg, k1, k2);
-      final aRInner = _calculateInnerTemp(aR, envTemp, rightAvg, k1, k2);
-
-      // 获取该相的温度状态
-      final phaseStatus = _getPhaseTemperatureStatus(alerts, phase);
-      
-      // 检查是否有局放值故障（用于左外和右外）
-      final hasPartialDischargeLeft = _hasPartialDischargeFault(alerts, phase, 0);
-      final hasPartialDischargeRight = _hasPartialDischargeFault(alerts, phase, 2);
-      final statusLeft = hasPartialDischargeLeft ? 3 : _getSimpleStatusValue(alerts, phase);
-      final statusRight = hasPartialDischargeRight ? 3 : _getSimpleStatusValue(alerts, phase);
-      final statusInner = _getSimpleStatusValue(alerts, phase);
-
-      // 根据offset返回对应的寄存器值
-      // 0=左外状态, 1=左外值, 2=中外值, 3=右外状态, 4=右外值, 5=中内状态, 6=中内值
-      if (offset == 0) {
-        // 左外温度状态（转换为简单状态值：0=正常，1=预警，2=故障，3=局放值故障）
-        data.add(0); // 高字节为0
-        data.add(statusLeft); // 低字节为状态值
-      } else if (offset == 1) {
-        // 左外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 0, aL);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 2) {
-        // 中外温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 1, aM);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 3) {
-        // 右外温度状态（转换为简单状态值：0=正常，1=预警，2=故障，3=局放值故障）
-        data.add(0); // 高字节为0
-        data.add(statusRight); // 低字节为状态值
-      } else if (offset == 4) {
-        // 右外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 2, aR);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 5) {
-        // 中内温度状态（转换为简单状态值：0=正常，1=预警，2=故障）
-        data.add(0); // 高字节为0
-        data.add(statusInner); // 低字节为状态值
-      } else if (offset == 6) {
-        // 中内温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 3, aMInner);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else {
-        data.add(0);
-        data.add(0);
-      }
-
-      return data;
-    } catch (e) {
-      print('❌ 获取相温度寄存器值失败: $e');
-      return [0, 0];
+  List<int> _encodeTempRegister(double filteredTemp) {
+    int raw;
+    if (filteredTemp == -999.0) {
+      raw = 0x8066;
+    } else {
+      final signedRaw = (filteredTemp / 0.01).round();
+      raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
     }
+    return [(raw >> 8) & 0xFF, raw & 0xFF];
   }
 
-  /// 过滤温度异常值
-  /// nodeId: 节点ID
-  /// phase: 相（A/B/C/ENV）
-  /// channelIndex: 通道索引（0=左外/上温度，1=中外/中温度，2=右外/下温度，3=中内）
-  /// rawTemp: 原始温度值
-  /// 返回：过滤后的温度值
   double _filterTemperatureValue(int nodeId, String phase, int channelIndex, double rawTemp) {
-    // 1. 处理开路值
-    if (rawTemp == -999.0) {
-      return -999.0;
-    }
-    
-    // 2. 基本范围检查（只检查下限，去掉上限）
-    if (rawTemp < _tempMinValue) {
-      print('⚠️ 温度值超出范围: 节点=$nodeId, 相=$phase, 通道=$channelIndex, 原始值=$rawTemp°C, 最小范围=$_tempMinValue°C');
-      // 返回历史值或默认值
-      final historyKey = '${nodeId}_${phase}_$channelIndex';
-      final history = _tempHistoryCache[historyKey];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last;
-        print('📊 使用历史值: $lastValidValue°C');
-        return lastValidValue;
-      }
-      return 25.0; // 默认值
-    }
-    
-    // 3. 获取历史记录
-    final historyKey = '${nodeId}_${phase}_$channelIndex';
-    final history = _tempHistoryCache.putIfAbsent(historyKey, () => <double>[]);
-    
-    // 4. 如果没有历史数据，直接使用当前值
-    if (history.isEmpty) {
-      history.add(rawTemp);
-      // 限制历史记录长度（最多保留10个）
-      if (history.length > 10) {
-        history.removeAt(0);
-      }
-      return rawTemp;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastValue = history.last;
-    
-    // 6. 检测异常跳变
-    final absDiff = (rawTemp - lastValue).abs();
-    if (absDiff > _tempJumpThreshold) {
-      print('⚠️ 温度异常跳变检测: 节点=$nodeId, 相=$phase, 通道=$channelIndex, 从$lastValue°C跳变到$rawTemp°C (变化=${absDiff.toStringAsFixed(1)}°C)');
-      // 使用上一次的有效值
-      history.add(lastValue); // 继续使用上次的值
-      // 限制历史记录长度
-      if (history.length > 10) {
-        history.removeAt(0);
-      }
-      return lastValue;
-    }
-    
-    // 7. 正常变化，使用当前值
-    history.add(rawTemp);
-    // 限制历史记录长度
-    if (history.length > 10) {
-      history.removeAt(0);
-    }
-    return rawTemp;
+    final key = '${nodeId}_${phase}_$channelIndex';
+    final isInner = channelIndex == 3;
+    final filter = _tempFilters.putIfAbsent(
+      key,
+      () => TempChannelFilter(
+        maxStep: isInner ? 3.0 : 1.5,
+        confirmCount: 6,
+      ),
+    );
+    return filter.filter(rawTemp);
   }
 
-  /// 获取环境参数单个寄存器的值（统一为36寄存器格式）
+  /// 获取环境参数单个寄存器的值（统一为36寄存器格式，使用与页面显示一致的数据）
   /// offset: 相对于环境参数起始地址的偏移（0-6）
   /// 寄存器映射：0=上温度值, 1=中温度值, 2=下温度值, 3=湿度状态, 4=湿度值, 5=压力状态, 6=压力值
-  /// 获取环境参数单个寄存器的值（sensor_flutter5专用，使用与页面显示一致的数据）
-  /// offset: 相对于环境参数起始地址的偏移（0-6）
-  List<int> _getEnvironmentRegisterValue5(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset, int nodeId) {
+  List<int> _getEnvironmentRegisterValue89(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset, int nodeId) {
     final data = <int>[];
     
     try {
@@ -1597,80 +1181,10 @@ class ModbusTcpServer {
     }
   }
 
-  List<int> _getEnvironmentRegister5(dynamic snapshot, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset, int nodeId) {
-    final data = <int>[];
-    
-    try {
-      final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
-      final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
-      final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
-      final humidityCorr = nodeSettings['humidityCorrection'] as double? ?? 0.0;
-
-      double upperTemp = (snapshot.temperature ?? 25) + upperCorr;
-      double middleTemp = (snapshot.temperature ?? 25) + middleCorr;
-      double lowerTemp = (snapshot.temperature ?? 25) + lowerCorr;
-      double correctedHumidity = ((snapshot.humidity ?? 0) + humidityCorr).clamp(0, 100);
-      final pressure = snapshot.pressureKpa ?? 0;
-
-      if (offset == 0) {
-        // 上温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, 'ENV', 0, upperTemp);
-        final raw = (filteredTemp * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 1) {
-        // 中温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, 'ENV', 1, middleTemp);
-        final raw = (filteredTemp * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 2) {
-        // 下温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, 'ENV', 2, lowerTemp);
-        final raw = (filteredTemp * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 3) {
-        // 湿度状态（转换为简单状态值：0=正常，1=预警，2=故障）
-        final statusFaultCode = _getSensorStatusValue(alerts, 'HUMIDITY');
-        final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-        data.add(0); // 高字节为0
-        data.add(statusValue); // 低字节为状态值
-      } else if (offset == 4) {
-        // 湿度值
-        final raw = (correctedHumidity * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else if (offset == 5) {
-        // 压力状态（转换为简单状态值：0=正常，1=预警，2=故障）
-        final statusFaultCode = _getSensorStatusValue(alerts, 'PRESSURE');
-        final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-        data.add(0); // 高字节为0
-        data.add(statusValue); // 低字节为状态值
-      } else if (offset == 6) {
-        // 压力值
-        final raw = (pressure * 100).round();
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
-      } else {
-        data.add(0);
-        data.add(0);
-      }
-
-      return data;
-    } catch (e) {
-      print('❌ 获取环境参数寄存器值失败: $e');
-      return [0, 0];
-    }
-  }
-
-  /// 获取烟雾和气体单个寄存器的值（统一为36寄存器格式）
+  /// 获取烟雾和气体单个寄存器的值（sensor_flutter89专用，使用与页面显示一致的数据）
   /// offset: 相对于烟雾和气体起始地址的偏移（0-7）
   /// 寄存器映射：每个参数2个寄存器（状态+数值），0-1=白烟, 2-3=黑烟, 4-5=H2, 6-7=CO
-  /// 获取烟雾和气体单个寄存器的值（sensor_flutter5专用，使用与页面显示一致的数据）
-  /// offset: 相对于烟雾和气体起始地址的偏移（0-7）
-  /// 寄存器映射：每个参数2个寄存器（状态+数值），0-1=白烟, 2-3=黑烟, 4-5=H2, 6-7=CO
-  List<int> _getSmokeAndGasRegisterValue5(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset) {
+  List<int> _getSmokeAndGasRegisterValue89(Map<String, dynamic> displayData, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset) {
     final data = <int>[];
     
     try {
@@ -1751,117 +1265,53 @@ class ModbusTcpServer {
     }
   }
 
-  List<int> _getSmokeAndGasRegister5(dynamic snapshot, Map<String, dynamic> nodeSettings, AlertInfo? alerts, int offset) {
-    final data = <int>[];
+  /// 获取简单状态值（统一为36寄存器格式）
+  /// 返回：0=正常，1=预警，2=故障
+  int _getSimpleStatusValue(AlertInfo? alerts, String phase) {
+    if (alerts == null) return 0; // 正常
+
+    // 查找该相相关的预警和故障（排除局放值故障）
+    final phaseWarnings = alerts.warnings.where((w) => 
+      w.contains('${phase}相') && !w.contains('局放值高')
+    ).toList();
+    final phaseFaults = alerts.faults.where((f) => 
+      f.contains('${phase}相') && !f.contains('局放值高')
+    ).toList();
     
-    try {
-      // 计算烟雾浓度
-      double _naturalLog(double x) {
-        if (x <= 0) return 0;
-        double result = 0.0;
-        double term = (x - 1) / (x + 1);
-        double termSquared = term * term;
-        for (int i = 0; i < 100; i++) {
-          result += term / (2 * i + 1);
-          term *= termSquared;
-        }
-        return 2 * result;
-      }
-
-      double _calculateSmokeConcentration(double xStar, double a, double T) {
-        final tSafe = (T == 0) ? 568.0 : T;
-        final delta = xStar - a;
-        if (delta <= 0) return 0.0;
-        final x0 = 568.0 * (delta / tSafe);
-        double m;
-        if (x0 < 568.0) {
-          m = -0.00000015 * x0 * x0 + 0.0007 * x0;
-        } else {
-          final lnX0 = _naturalLog(x0);
-          m = 0.2772 * lnX0 - 1.408;
-        }
-        return m < 0 ? 0 : m;
-      }
-
-      final paramIndex = offset ~/ 2; // 参数索引：0=白烟, 1=黑烟, 2=H2, 3=CO
-      final isStatus = (offset % 2 == 0); // 是否为状态寄存器
-
-      if (paramIndex == 0) {
-        // 白烟
-        final statusFaultCode = _getSensorStatusValue(alerts, 'SMOKE');
-        if (isStatus) {
-          // 状态寄存器（转换为简单状态值：0=正常，1=预警，2=故障）
-          final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-          data.add(0); // 高字节为0
-          data.add(statusValue); // 低字节为状态值
-        } else {
-          double value = 0;
-          if (snapshot.smokeChannelA != null) {
-            final aA = (snapshot.smokeCalibA ?? 0).toDouble();
-            final tA = (snapshot.smokeThreshA ?? 568).toDouble();
-            value = _calculateSmokeConcentration(snapshot.smokeChannelA!.toDouble(), aA, tA);
-          }
-          final raw = (value * 1000).round().clamp(0, 65535);
-          data.add((raw >> 8) & 0xFF);
-          data.add(raw & 0xFF);
-        }
-      } else if (paramIndex == 1) {
-        // 黑烟
-        final statusFaultCode = _getSensorStatusValue(alerts, 'SMOKE');
-        if (isStatus) {
-          // 状态寄存器（转换为简单状态值：0=正常，1=预警，2=故障）
-          final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-          data.add(0); // 高字节为0
-          data.add(statusValue); // 低字节为状态值
-        } else {
-          double value = 0;
-          if (snapshot.smokeChannelB != null) {
-            final aB = (snapshot.smokeCalibB ?? 0).toDouble();
-            final tB = (snapshot.smokeThreshB ?? 568).toDouble();
-            value = _calculateSmokeConcentration(snapshot.smokeChannelB!.toDouble(), aB, tB);
-          }
-          final raw = (value * 1000).round().clamp(0, 65535);
-          data.add((raw >> 8) & 0xFF);
-          data.add(raw & 0xFF);
-        }
-      } else if (paramIndex == 2) {
-        // H2
-        final statusFaultCode = _getSensorStatusValue(alerts, 'H2');
-        if (isStatus) {
-          // 状态寄存器（转换为简单状态值：0=正常，1=预警，2=故障）
-          final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-          data.add(0); // 高字节为0
-          data.add(statusValue); // 低字节为状态值
-        } else {
-          final h2 = snapshot.h2Percentage?.round() ?? 0;
-          data.add(h2.clamp(0, 255));
-          data.add(0); // 填充字节
-        }
-      } else if (paramIndex == 3) {
-        // CO
-        final statusFaultCode = _getSensorStatusValue(alerts, 'CO');
-        if (isStatus) {
-          // 状态寄存器（转换为简单状态值：0=正常，1=预警，2=故障）
-          final statusValue = _getSimpleStatusFromFaultCode(statusFaultCode);
-          data.add(0); // 高字节为0
-          data.add(statusValue); // 低字节为状态值
-        } else {
-          final rawCo = snapshot.coPpm?.toDouble() ?? 0;
-          final coConcentration = (rawCo < 0 || rawCo > 10000) ? 0 : rawCo;
-          final coRaw = coConcentration.round();
-          data.add((coRaw >> 8) & 0xFF);
-          data.add(coRaw & 0xFF);
-        }
-      } else {
-        data.add(0);
-        data.add(0);
-      }
-
-      return data;
-    } catch (e) {
-      print('❌ 获取烟雾和气体寄存器值失败: $e');
-      return [0, 0];
+    // 优先返回故障（故障优先级高于预警）
+    if (phaseFaults.isNotEmpty) {
+      return 2; // 故障
+    } else if (phaseWarnings.isNotEmpty) {
+      return 1; // 预警
     }
+    
+    return 0; // 正常
+  }
+
+  /// 将故障码转换为简单状态值：0=正常，1=预警，2=故障
+  /// 故障码范围：0xE0-0xEF为预警，0xF0-0xFF为故障
+  int _getSimpleStatusFromFaultCode(int faultCode) {
+    if (faultCode == 0) return 0; // 正常
+    if (faultCode >= 0xE0 && faultCode < 0xF0) return 1; // 预警
+    if (faultCode >= 0xF0) return 2; // 故障
+    return 0; // 默认正常
+  }
+
+  /// 检查是否有局放值故障
+  bool _hasPartialDischargeFault(AlertInfo? alerts, String phase, int tempIndex) {
+    if (alerts == null) return false;
+    
+    // tempIndex: 0=左外，1=中外，2=右外，3=中内
+    // 局放值故障只影响左外和右外（tempIndex 0和2）
+    if (tempIndex != 0 && tempIndex != 2) return false;
+    
+    // 查找该相的局放值故障
+    final partialDischargeFaults = alerts.faults.where((f) => 
+      f.contains('${phase}相') && f.contains('局放值高')
+    ).toList();
+    
+    return partialDischargeFaults.isNotEmpty;
   }
 }
+
 

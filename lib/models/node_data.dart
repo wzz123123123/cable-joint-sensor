@@ -121,16 +121,11 @@ class NodeData {
     return '$hour:$minute:$second';
   }
 
-  // 获取连接状态颜色（基于查询判断逻辑，需要传入连接状态）
-  String getConnectionStatusColor({bool? isConnectedFromQuery}) {
-    // 如果传入了基于查询判断的连接状态，优先使用
-    if (isConnectedFromQuery != null) {
-      return isConnectedFromQuery ? '#00C853' : '#D50000';
-    }
-    
-    // 否则使用备用判断（基于时间戳和数据）
+  // 获取连接状态颜色
+  String getConnectionStatusColor() {
+    // 40秒无任何数据则判定超时 → 红灯
     final now = DateTime.now().millisecondsSinceEpoch;
-    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp!) > 10000;
+    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp!) > 40000;
     if (isStale) return '#D50000';
     // 有实际传感器数据则绿灯，否则灰灯
     final hasData = temperature != null || humidity != null || coPpm != null || 
@@ -139,16 +134,10 @@ class NodeData {
     return hasData ? '#00C853' : '#BDBDBD';
   }
 
-  // 获取连接状态文本（基于查询判断逻辑，需要传入连接状态）
-  String getConnectionStatusText({bool? isConnectedFromQuery}) {
-    // 如果传入了基于查询判断的连接状态，优先使用
-    if (isConnectedFromQuery != null) {
-      return isConnectedFromQuery ? '已连接' : '未连接';
-    }
-    
-    // 否则使用备用判断（基于时间戳和数据）
+  // 获取连接状态文本
+  String getConnectionStatusText() {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp!) > 10000;
+    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp!) > 40000;
     if (isStale) return '未连接';
     // 有实际传感器数据则已连接，否则未连接
     final hasData = temperature != null || humidity != null || coPpm != null || 

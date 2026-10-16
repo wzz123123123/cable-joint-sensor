@@ -1,11 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:math' as math;
 import 'csv_logger_service.dart';
 import 'modbus_tcp_server.dart';
+import 'modbus_tcp_client.dart';
 import 'alert_service.dart';
-import 'settings_service.dart';
 import 'rs485_protocol.dart';
+import 'rs485_serial_service.dart';
+import 'serial_debug_logger.dart';
+import 'settings_service.dart';
+import 'temp_channel_filter.dart';
+import 'node_data_calculator.dart';
+import 'background_cpu_service.dart';
 
 class SensorData {
   final int nodeId;
@@ -65,38 +71,34 @@ class SensorData {
   });
 
   Map<String, dynamic> toMap() {
-    final map = <String, dynamic>{
+    return {
       'node_id': nodeId,
       'sensor_type': sensorType,
       'timestamp': timestamp,
+      'temperature': temperature,
+      'humidity': humidity,
+      'co_ppm': coPpm,
+      'h2_percentage': h2Percentage,
+      'pressure_kpa': pressureKpa,
+      'pressure_temp_c': pressureTempC,
+      'smoke_status': smokeStatus,
+      'smoke_external_temp_c': smokeExternalTempC,
+      'smoke_channel_a': smokeChannelA,
+      'smoke_channel_b': smokeChannelB,
+      'smoke_calib_a': smokeCalibA,
+      'smoke_calib_b': smokeCalibB,
+      'smoke_thresh_a': smokeThreshA,
+      'smoke_thresh_b': smokeThreshB,
+      'pt100_temperatures': pt100Temperatures,
+      'fan_status': fanStatus,
+      'fan_timer': fanTimer,
+      'st_co_len': stCoLen,
+      'st_smoke_len': stSmokeLen,
+      'st_h2_len': stH2Len,
+      'st_pt100_len': stPt100Len,
+      'st_th_len': stThLen,
+      'st_pressure_len': stPressureLen,
     };
-    
-    // 只添加非null的字段
-    if (temperature != null) map['temperature'] = temperature;
-    if (humidity != null) map['humidity'] = humidity;
-    if (coPpm != null) map['co_ppm'] = coPpm;
-    if (h2Percentage != null) map['h2_percentage'] = h2Percentage;
-    if (pressureKpa != null) map['pressure_kpa'] = pressureKpa;
-    if (pressureTempC != null) map['pressure_temp_c'] = pressureTempC;
-    if (smokeStatus != null) map['smoke_status'] = smokeStatus;
-    if (smokeExternalTempC != null) map['smoke_external_temp_c'] = smokeExternalTempC;
-    if (smokeChannelA != null) map['smoke_channel_a'] = smokeChannelA;
-    if (smokeChannelB != null) map['smoke_channel_b'] = smokeChannelB;
-    if (smokeCalibA != null) map['smoke_calib_a'] = smokeCalibA;
-    if (smokeCalibB != null) map['smoke_calib_b'] = smokeCalibB;
-    if (smokeThreshA != null) map['smoke_thresh_a'] = smokeThreshA;
-    if (smokeThreshB != null) map['smoke_thresh_b'] = smokeThreshB;
-    if (pt100Temperatures != null) map['pt100_temperatures'] = pt100Temperatures;
-    if (fanStatus != null) map['fan_status'] = fanStatus;
-    if (fanTimer != null) map['fan_timer'] = fanTimer;
-    if (stCoLen != null) map['st_co_len'] = stCoLen;
-    if (stSmokeLen != null) map['st_smoke_len'] = stSmokeLen;
-    if (stH2Len != null) map['st_h2_len'] = stH2Len;
-    if (stPt100Len != null) map['st_pt100_len'] = stPt100Len;
-    if (stThLen != null) map['st_th_len'] = stThLen;
-    if (stPressureLen != null) map['st_pressure_len'] = stPressureLen;
-    
-    return map;
   }
 
   static SensorData fromMap(Map<String, dynamic> map) {
@@ -145,30 +147,6 @@ class TempHistoryEntry {
   final int timestamp;
   
   TempHistoryEntry(this.value, this.timestamp);
-}
-
-// 压力值历史记录条目
-class PressureHistoryEntry {
-  final double value;
-  final int timestamp;
-  
-  PressureHistoryEntry(this.value, this.timestamp);
-}
-
-// 氢气值历史记录条目
-class H2HistoryEntry {
-  final double value;
-  final int timestamp;
-  
-  H2HistoryEntry(this.value, this.timestamp);
-}
-
-// 烟雾值历史记录条目
-class SmokeHistoryEntry {
-  final int value;
-  final int timestamp;
-  
-  SmokeHistoryEntry(this.value, this.timestamp);
 }
 
 // 湿度值历史记录条目
@@ -312,119 +290,102 @@ class SensorDataService {
   // 数据更新回调
   Function(int sensorType, SensorData data)? _onDataUpdate;
   
-  // 获取节点数据的回调
-  Function(int nodeId)? _onGetNodeData;
-  
   // 内存中的数据存储
   final List<SensorData> _dataList = [];
   
   // 网络状态检测
   bool _isNetworkAvailable = true;
   Timer? _networkCheckTimer;
-
-  // Modbus TCP服务器
+  
+  // Modbus TCP客户端和AlertService实例
   final ModbusTcpServer _modbusServer = ModbusTcpServer();
-  
-  // AlertService实例
+  final ModbusTcpClient _modbusClient = ModbusTcpClient();
   final AlertService _alertService = AlertService();
-  
-  // SettingsService实例
-  final SettingsService _settingsService = SettingsService();
-  
-  // 节点连接状态跟踪
-  final Map<int, bool> _nodeConnectionStates = {};
-  Timer? _minuteDataTimer;
-  
-  // 移除测试故障计数器，只检测真实故障
-  
-  // 每秒汇总日志
-  int _dataProcessedCount = 0;
-  Timer? _summaryTimer;
+
+  // CO：10秒内突变视为误报；压力：窗口中值滤波
+  final Map<int, int> _coStableValues = {};
+  final Map<int, int> _coPendingValues = {};
+  final Map<int, int> _coPendingSince = {};
+  final Map<int, double> _h2StableValues = {};
+  final Map<int, int> _h2SpikeCounts = {};
+  final Map<int, List<double>> _pressureWindow = {};
+  final Map<int, double> _pressureLastGood = {};
 
   // 设置数据更新回调
   void setDataUpdateCallback({required Function(int sensorType, SensorData data) onDataUpdate}) {
     _onDataUpdate = onDataUpdate;
   }
-  
-  // 设置获取节点数据的回调
-  void setGetNodeDataCallback({required Function(int nodeId) onGetNodeData}) {
-    _onGetNodeData = onGetNodeData;
-  }
 
-  // 检查网络连接状态（改为检查本地TCP服务器状态，与HarmonyOS版本一致）
   Future<bool> _checkNetworkConnection() async {
-    // 检查服务器是否运行和有客户端连接
-    if (!_isConnected || !_isClientConnected) {
+    if (!_isConnected || !_isClientConnected || !_serial.isOpen) {
       return false;
     }
-    
-    // 检查是否有最近的数据更新（2秒内有数据更新说明连接正常）
     final now = DateTime.now().millisecondsSinceEpoch;
-    final hasRecentData = _dataList.any((data) => 
-      (now - data.timestamp) < 3000); // 3秒内有数据更新
-    
+    final hasRecentData = _dataList.any((data) =>
+      (now - data.timestamp) < 3000);
     return hasRecentData;
   }
 
-  // 启动网络状态检测
   void _startNetworkMonitoring() {
-    _networkCheckTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      final isConnected = await _checkNetworkConnection();
-      if (isConnected != _isNetworkAvailable) {
-        _isNetworkAvailable = isConnected;
-        // 通知CSV服务连接状态
-        CsvLoggerService.instance.setConnectionStatus(_isNetworkAvailable);
-        if (!_isNetworkAvailable) {
-          print('TCP服务器连接断开，停止数据接收');
-          _connectionStatus = '服务器未启动';
-        } else {
-          print('TCP服务器连接恢复');
-          _connectionStatus = '客户端已连接';
-        }
-      }
-    });
+    // 连接状态由串口收发决定。旧逻辑用 _dataList 3秒窗口，RS485解析不会写入 _dataList，会把CSV误判成断开。
   }
 
-  // 停止网络状态检测
   void _stopNetworkMonitoring() {
     _networkCheckTimer?.cancel();
     _networkCheckTimer = null;
   }
 
-  // 启动数据接收（真实TCP服务器）
   Future<void> startReceiving() async {
     try {
       _isConnected = true;
-      _connectionStatus = '等待客户端连接...';
-      print('传感器服务已启动，等待设备连接...');
-      // 预创建当天CSV并标记为未连接（等待真正连接/数据到达再变更）
-      unawaited(CsvLoggerService.instance.ensureFileForDate(DateTime.now()));
+      _connectionStatus = '正在打开串口...';
+      print('传感器服务已启动，准备打开TTL/485串口...');
+      unawaited(CsvLoggerService.instance.ensureFileForDate(DateTime.now())); // 分别创建节点1-5当天文件
       CsvLoggerService.instance.setConnectionStatus(false);
 
-      // 启动网络状态监控
       _startNetworkMonitoring();
-      // 启动CSV聚合与周期写入
       CsvLoggerService.instance.start();
-      
-      // 不再在CSV保存后向远端服务器发送历史数据
 
-    // 启动Modbus TCP服务器，等待客户端连接
-    print('🚀 准备启动Modbus TCP服务器...');
-    _modbusServer.start();
-    print('✅ Modbus TCP服务器启动完成');
-    // 设置 SensorDataService 引用，使 AlertService 可以使用查询判断逻辑
-    _alertService.setSensorDataService(this);
-    print('✅ AlertService Modbus连接启动完成');
+      CsvLoggerService.instance.setHistoryDataSendCallback((nodeId, data) {
+        _sendHistoryDataToServer(data, nodeId: nodeId);
+      });
 
-      // 启动每秒汇总日志
-      print('🚀 准备启动每秒汇总日志...');
-      _startSummaryTimer();
-      print('✅ 每秒汇总日志启动完成');
+      print('✅ 历史数据自动发送已启用');
 
-      // 启动真实的TCP服务器
-      print('🚀 准备启动TCP服务器...');
-      await _startTcpServer();
-      print('✅ TCP服务器启动完成');
+    try {
+      await BackgroundCpuService.instance.start();
+      for (final id in _pollNodeIds) {
+        final s = await SettingsService().getAllSettingsForNode(id);
+        BackgroundCpuService.instance.updateSettings(id, s);
+      }
+      print('✅ 上传后台isolate已启动');
+    } catch (e) {
+      print('⚠️ 上传后台isolate启动失败: $e');
+    }
+
+    print('🚀 准备启动Modbus TCP连接监控...');
+    try {
+      await _modbusServer.start();
+      _modbusClient.startConnectionMonitoring();
+      print('✅ Modbus TCP连接监控启动完成');
+    } catch (e) {
+      print('⚠️ Modbus TCP服务器启动失败（不影响RS485采集）: $e');
+    }
+
+    print('🚀 准备启动AlertService Modbus连接...');
+    try {
+      _alertService.startModbusConnection();
+      print('✅ AlertService Modbus连接启动完成');
+    } catch (e) {
+      print('⚠️ AlertService Modbus连接启动失败（不影响RS485采集）: $e');
+    }
+
+    try {
+      await _startRs485();
+    } catch (e) {
+      print('⚠️ RS485串口启动失败: $e');
+      rethrow;
+    }
     } catch (e) {
       print('启动传感器服务失败: $e');
       _isConnected = false;
@@ -432,130 +393,156 @@ class SensorDataService {
     }
   }
 
-  // 启动TCP服务器
-  Future<void> _startTcpServer() async {
-    try {
-      final server = await ServerSocket.bind(InternetAddress('0.0.0.0'), 10123);
-      print('TCP服务器已启动，监听地址: 0.0.0.0:10123');
-      _connectionStatus = '等待客户端连接...';
-      
-      server.listen((clientSocket) {
-        final clientAddress = clientSocket.remoteAddress.address;
-        final clientInfo = '$clientAddress:${clientSocket.remotePort}';
-        
-        print('客户端已连接: $clientInfo');
-        _isClientConnected = true;
-        _connectionStatus = '客户端已连接';
-        // 通知CSV服务：已连接
-        CsvLoggerService.instance.setConnectionStatus(true);
-        
-        // 发送Modbus TCP连接通知
-        _sendModbusConnectionChange(true);
-        
-        // 保存客户端连接引用
-        _currentClientSocket = clientSocket;
-        
-        // 处理客户端数据
-        clientSocket.listen(
-          (data) {
-            print('收到数据，长度: ${data.length}');
-            _rxPackets++;
-            _rxBytes += data.length;
-            
-            // 处理接收到的数据
-            _processReceivedData(data);
-          },
-          onError: (error) {
-            print('客户端连接错误: $error');
-            _isClientConnected = false;
-            _connectionStatus = '客户端断开';
-            _currentClientSocket = null;
-            // 通知CSV服务：断开
-            CsvLoggerService.instance.setConnectionStatus(false);
-            
-            // 发送Modbus TCP断开通知
-            _sendModbusConnectionChange(false);
-          },
-          onDone: () {
-            print('客户端连接关闭');
-            _isClientConnected = false;
-            _connectionStatus = '等待客户端连接...';
-            _currentClientSocket = null;
-            // 通知CSV服务：断开
-            CsvLoggerService.instance.setConnectionStatus(false);
-            
-            // 发送Modbus TCP断开通知
-            _sendModbusConnectionChange(false);
-          },
-        );
-        
-        // 启动主动查询定时器
+  static const List<int> _pollNodeIds = [1, 2, 3, 4, 5];
+  /// 发出查询后最多等 200ms。未收到返回则改询下一节点，本轮不再补发当前节点。
+  /// 若 200ms 内已经开始收数，则等整帧收齐再解析。
+  static const int _firstByteTimeoutMs = 200;
+  static const int _completeFrameTimeoutMs = 1000;
+  /// 收到并解析完一帧后，等 20ms 再发下一条取数指令。
+  static const int _busTurnaroundMs = 20;
+
+  final Rs485SerialService _serial = Rs485SerialService();
+  final List<int> _rxBuffer = <int>[];
+  bool _gotResponseThisSlot = false;
+  bool _pollLoopRunning = false;
+  Timer? _rxIdleTimer;
+  Completer<void>? _slotFrameCompleter;
+
+  Future<void> _startRs485() async {
+    _serial.onData = _onSerialBytes;
+    _serial.onStatus = (open, status) {
+      _isClientConnected = open;
+      _connectionStatus = status;
+      CsvLoggerService.instance.setConnectionStatus(open);
+      print(open ? '✅ $status' : '⚠️ $status');
+      if (open) {
         _startActiveQuery();
-      });
-      
-      // 保存服务器引用以便后续关闭
-      _tcpServer = server;
-    } catch (e) {
-      print('启动TCP服务器失败: $e');
-      _isConnected = false;
-      _connectionStatus = '启动失败';
+      }
+    };
+    await _serial.start();
+  }
+
+  void _onSerialBytes(List<int> data) {
+    if (data.isEmpty) return;
+    _rxPackets++;
+    _rxBytes += data.length;
+    _lastRawHex = data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    SerialDebugLogger.instance.logRx(data);
+    CsvLoggerService.instance.setConnectionStatus(true);
+    _rxBuffer.addAll(data);
+    if (_rxBuffer.length > 2048) {
+      _rxBuffer.removeRange(0, _rxBuffer.length - 1024);
+    }
+    _extractAndProcessFrames();
+    _rxIdleTimer?.cancel();
+    _rxIdleTimer = Timer(const Duration(milliseconds: 40), _flushIdleFrame);
+  }
+
+  bool _isQueryEcho(List<int> buf, int offset) {
+    return buf.length - offset >= 7 &&
+        buf[offset] == 0xA5 &&
+        buf[offset + 2] == 0x0D &&
+        buf[offset + 3] == 0x0A &&
+        buf[offset + 4] == 0x00;
+  }
+
+  bool _hasIncomingResponse() {
+    var i = 0;
+    while (_isQueryEcho(_rxBuffer, i)) {
+      i += 7;
+    }
+    if (i >= _rxBuffer.length) return false;
+    if (_rxBuffer[i] == 0xA5 && _rxBuffer.length - i < 7) {
+      return false;
+    }
+    return _isFrameHeader(_rxBuffer, i);
+  }
+
+  void _completeSlotFrame() {
+    final waiter = _slotFrameCompleter;
+    if (waiter != null && !waiter.isCompleted) {
+      waiter.complete();
     }
   }
 
-  ServerSocket? _tcpServer;
-  Socket? _currentClientSocket;
+  bool _isTrackedNode(int nodeId) => _pollNodeIds.contains(nodeId);
+
+  bool _isFrameHeader(List<int> buf, int offset) {
+    if (buf.length - offset < 3) return false;
+    final nodeId = buf[offset];
+    final frameType = buf[offset + 1];
+    return _isTrackedNode(nodeId) && (frameType == 0x0D || frameType == 0x0C);
+  }
+
+  int _resolveFrameLength(List<int> buf) {
+    // 现场协议：第三字节是整帧总长，例如 0x58=88。
+    final lenByte = buf[2];
+    if (lenByte >= 5 && lenByte <= 250) {
+      return lenByte;
+    }
+    return -1;
+  }
+
+  void _extractAndProcessFrames() {
+    while (_rxBuffer.isNotEmpty) {
+      if (_rxBuffer[0] == 0xA5) {
+        if (_rxBuffer.length < 7) {
+          return;
+        }
+        if (_isQueryEcho(_rxBuffer, 0)) {
+          _rxBuffer.removeRange(0, 7);
+          continue;
+        }
+      }
+      if (_rxBuffer.length < 5) {
+        return;
+      }
+      if (!_isFrameHeader(_rxBuffer, 0)) {
+        _rxBuffer.removeAt(0);
+        continue;
+      }
+
+      final frameLen = _resolveFrameLength(_rxBuffer);
+      if (frameLen < 5) {
+        _rxBuffer.removeAt(0);
+        continue;
+      }
+      if (_rxBuffer.length < frameLen) {
+        return;
+      }
+
+      final frame = List<int>.from(_rxBuffer.sublist(0, frameLen));
+      _rxBuffer.removeRange(0, frameLen);
+      _framesExtracted++;
+      _lastFrameHex = frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      _processReceivedData(frame);
+    }
+  }
+
+  void _flushIdleFrame() {
+    // 只按完整帧长度提取，不完整的继续等，避免半包把缓冲打乱后假掉线。
+    _extractAndProcessFrames();
+  }
+
+  void _flushRemainingBuffer() {
+    _flushIdleFrame();
+  }
+
   Timer? _queryTimer;
-  // 动态观测到的节点集合（最多5个用于主动查询）
   final Set<int> _observedNodeIds = <int>{};
-  
-  // 节点连接状态跟踪：记录每个节点是否已响应
   final Map<int, bool> _nodeResponseStatus = <int, bool>{};
-  // 节点连续未收到响应的次数
   final Map<int, int> _nodeNoResponseCount = <int, int>{};
-  // 当前正在查询的节点ID（用于响应匹配）
   int? _currentQueryingNodeId;
-  // 节点响应等待的Completer
   final Map<int, Completer<bool>> _nodeResponseCompleters = <int, Completer<bool>>{};
-  // 是否正在轮询中
   bool _isPolling = false;
-  // 当前轮询的节点索引（用于1-5轮流发送）
   int _currentPollingIndex = 0;
-  
-  // 保留用于兼容的变量
-  final Map<int, int> _nodeLastDataTime = {}; // 每个节点的最后数据时间戳
-  final Map<int, int> _nodeLastSuccessTime = {}; // 每个节点的最后成功时间戳（用于判断是否真的断开）
   
   // CO值历史记录（用于传感器故障检测）
   // 每个节点维护一个滑动窗口，记录最近3秒内的CO值和时间戳
   final Map<int, List<CoHistoryEntry>> _coHistory = <int, List<CoHistoryEntry>>{};
   
-  // CO突变检测状态
-  // 用于跟踪可能的突变值，判断是真实预警还是传感器故障
-  final Map<int, CoSpikeState> _coSpikeStates = <int, CoSpikeState>{};
-  
-  // 温度值历史记录（用于传感器故障检测）
-  // 每个节点每个通道维护一个滑动窗口，记录最近3秒内的温度值和时间戳
-  // key格式: "nodeId_channelIndex"
-  final Map<String, List<TempHistoryEntry>> _tempHistory = <String, List<TempHistoryEntry>>{};
-  
-  // 温度突变检测状态
-  // 用于跟踪可能的突变值，判断是真实预警还是传感器故障
-  // key格式: "nodeId_channelIndex"
-  final Map<String, TempSpikeState> _tempSpikeStates = <String, TempSpikeState>{};
-  
-  // 压力值历史记录（用于传感器故障检测）
-  // 每个节点维护一个滑动窗口，记录最近3秒内的压力值和时间戳
-  final Map<int, List<PressureHistoryEntry>> _pressureHistory = <int, List<PressureHistoryEntry>>{};
-  
-  // 压力突变检测状态
-  final Map<int, TempSpikeState> _pressureSpikeStates = <int, TempSpikeState>{};
-  
-  // 氢气值历史记录（用于传感器故障检测）
-  // 每个节点维护一个滑动窗口，记录最近3秒内的氢气值和时间戳
-  final Map<int, List<H2HistoryEntry>> _h2History = <int, List<H2HistoryEntry>>{};
-  
-  // 氢气突变检测状态
-  final Map<int, TempSpikeState> _h2SpikeStates = <int, TempSpikeState>{};
+  // 温度：5点中值去尖峰，超过1.5℃需连续6次确认（接头热惯性）
+  final Map<String, TempChannelFilter> _tempFilters = <String, TempChannelFilter>{};
   
   // 湿度值历史记录（用于传感器故障检测）
   // 每个节点维护一个滑动窗口，记录最近3秒内的湿度值和时间戳
@@ -564,32 +551,9 @@ class SensorDataService {
   // 湿度突变检测状态
   final Map<int, TempSpikeState> _humiditySpikeStates = <int, TempSpikeState>{};
   
-  // 烟雾值历史记录（用于传感器故障检测）
-  // 每个节点每个通道维护一个滑动窗口，记录最近3秒内的烟雾值和时间戳
-  // key格式: "nodeId_channelA" 或 "nodeId_channelB"
-  final Map<String, List<SmokeHistoryEntry>> _smokeHistory = <String, List<SmokeHistoryEntry>>{};
-  
-  // 烟雾突变检测状态
-  // key格式: "nodeId_channelA" 或 "nodeId_channelB"
-  final Map<String, CoSpikeState> _smokeSpikeStates = <String, CoSpikeState>{};
-
-  // 故障/预警保持计时（上报用）：key = "nodeId|faultKey"
-  final Map<String, DateTime?> _alertHoldStarts = {};
-
-  bool _shouldHoldTrigger(String key, bool over, int holdMs) {
-    final now = DateTime.now();
-    final start = _alertHoldStarts[key];
-    if (over) {
-      if (start == null) {
-        _alertHoldStarts[key] = now;
-        return false;
-      }
-      return now.difference(start).inMilliseconds >= holdMs;
-    } else {
-      _alertHoldStarts[key] = null;
-      return false;
-    }
-  }
+  // CO突变检测状态
+  // 用于跟踪可能的突变值，判断是真实预警还是传感器故障
+  final Map<int, CoSpikeState> _coSpikeStates = <int, CoSpikeState>{};
 
   // 处理接收到的数据
   void _processReceivedData(List<int> data) {
@@ -602,37 +566,6 @@ class SensorDataService {
       
       _lastRawHex = hexData;
       
-      // 检查是否为查询确认响应 (A5 [nodeId] 0D 0A 00 [CRC16])
-      if (data.length >= 7 && data[0] == 0xA5 && data[2] == 0x0D && data[3] == 0x0A && data[4] == 0x00) {
-        final nodeId = data[1];
-        if (nodeId >= 1 && nodeId <= 9) {
-          print('收到查询确认响应: 节点=$nodeId');
-          // 保存接收到的原始数据（收到一次记录一次）
-          unawaited(CsvLoggerService.instance.saveDataTransferLog(nodeId, '接收', data, DateTime.now()));
-          
-          // 通知节点响应（如果在等待该节点的响应）
-          if (_nodeResponseCompleters.containsKey(nodeId)) {
-            final completer = _nodeResponseCompleters[nodeId];
-            if (!completer!.isCompleted) {
-              completer.complete(true);
-              print('节点$nodeId: 收到查询确认响应');
-            }
-          }
-          
-          // 节点有响应，重置计数器并标记为已连接
-          _nodeNoResponseCount[nodeId] = 0;
-          _nodeResponseStatus[nodeId] = true;
-          
-          // 记录观测到的节点（最多5个）
-          _observedNodeIds.add(nodeId);
-          if (_observedNodeIds.length > 5) {
-            _observedNodeIds.remove(_observedNodeIds.first);
-          }
-          
-          return; // 查询确认响应处理完成，不再继续处理
-        }
-      }
-      
       // 根据HarmonyOS协议解析数据帧
       if (data.length >= 5) {
         final rawNodeId = data[0];
@@ -640,32 +573,33 @@ class SensorDataService {
         final totalLen = data[2];
         
         // 验证节点ID范围（1-9），如果超出范围则跳过处理
-        if (rawNodeId < 1 || rawNodeId > 9) {
-          print('⚠️ 无效的节点ID: $rawNodeId (范围应为1-9)，跳过处理');
-          print('   原始数据: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+        if (!_isTrackedNode(rawNodeId)) {
           return;
         }
         
         final nodeId = rawNodeId;
+        CsvLoggerService.instance.saveDataTransferLog(nodeId, '接收', data, DateTime.now());
         
-        // 保存接收到的原始数据（收到一次记录一次）
-        unawaited(CsvLoggerService.instance.saveDataTransferLog(nodeId, '接收', data, DateTime.now()));
-        
-        // 记录观测到的节点（最多5个）
+        // 记录观测到的节点（最多2个）
         _observedNodeIds.add(nodeId);
-        if (_observedNodeIds.length > 5) {
-          // 保持集合不超过5个：移除最早的一个（将Set转List按插入顺序不可保证，这里简单移除一个任意元素）
+        if (_observedNodeIds.length > 2) {
+          // 保持集合不超过2个：移除最早的一个（将Set转List按插入顺序不可保证，这里简单移除一个任意元素）
           _observedNodeIds.remove(_observedNodeIds.first);
         }
 
-        // print('解析帧头: 节点=$nodeId, 类型=0x${frameType.toRadixString(16)}, 长度=$totalLen');
+        print('解析帧头: 节点=$nodeId, 类型=0x${frameType.toRadixString(16)}, 长度=$totalLen');
+        unawaited(SerialDebugLogger.instance.log(
+            '[解析] 节点$nodeId 类型=0x${frameType.toRadixString(16).padLeft(2, '0')} 长度字段=$totalLen 实际=${data.length}'));
         
         if (frameType == 0x0D) {
-          // 数据帧 - 解析传感器数据
           _parseDataFrame(nodeId, data);
         } else if (frameType == 0x0C) {
-          // 状态帧 - 解析连接状态
           _parseStatusFrame(nodeId, data);
+        }
+
+        if (_currentQueryingNodeId == null || _currentQueryingNodeId == nodeId) {
+          _gotResponseThisSlot = true;
+          _completeSlotFrame();
         }
       }
     } catch (e) {
@@ -676,7 +610,7 @@ class SensorDataService {
   // 解析数据帧 - 根据HarmonyOS原项目逻辑
   void _parseDataFrame(int nodeId, List<int> data) {
     try {
-      // print('解析数据帧: 节点=$nodeId, 长度=${data.length}');
+      print('解析数据帧: 节点=$nodeId, 长度=${data.length}');
       
       // 节点有数据接收，重置计数器并标记为已连接
       _nodeNoResponseCount[nodeId] = 0;
@@ -701,7 +635,7 @@ class SensorDataService {
         print('非复合数据帧，跳过解析');
       }
       
-      // print('数据帧解析完成: 节点=$nodeId');
+      print('数据帧解析完成: 节点=$nodeId');
     } catch (e) {
       print('解析数据帧失败: $e');
     }
@@ -712,64 +646,84 @@ class SensorDataService {
     try {
       int idx = 3; // 从第3个字节开始解析字段
       
-      while (idx + 2 <= frame.length - 2) {
-        final fieldId = frame[idx++];
-        print('发现字段: ID=0x${fieldId.toRadixString(16).padLeft(2, '0')} (idx=${idx - 1})');
+      while (idx + 2 <= frame.length) {
+        if (idx >= frame.length) break;
+        final fieldId = frame[idx];
+        print('发现字段: ID=0x${fieldId.toRadixString(16).padLeft(2, '0')} (idx=$idx)');
         
         if (fieldId < 0x02 || fieldId > 0x07) {
           print('字段解析结束，遇到字段ID: 0x${fieldId.toRadixString(16).padLeft(2, '0')}');
           break;
         }
         
-        if (idx >= frame.length - 2) break;
-        final fieldLen = frame[idx++];
+        idx++; // 跳过字段ID
+        if (idx >= frame.length) break;
+        final fieldLen = frame[idx];
+        print('字段长度: len=$fieldLen (0x${fieldLen.toRadixString(16)}) at idx=$idx');
+        
+        idx++; // 跳过字段长度
         
         // 检查字段长度是否足够
-        if (idx + fieldLen + 2 > frame.length - 2) {
+        if (idx + fieldLen > frame.length) {
           print('字段长度越界: id=0x${fieldId.toRadixString(16)} len=$fieldLen idx=$idx 总长=${frame.length}');
           break;
         }
         
         final payloadStart = idx;
         final payload = frame.sublist(payloadStart, payloadStart + fieldLen);
-        print('字段开始: id=0x${fieldId.toRadixString(16)} len=$fieldLen at=$payloadStart..${payloadStart + fieldLen - 1}');
+        final payloadHex = payload.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+        print('字段开始: id=0x${fieldId.toRadixString(16)} len=$fieldLen at=$payloadStart..${payloadStart + fieldLen - 1} payload=[$payloadHex]');
         idx += fieldLen;
-        
-        // 跳过填充字节
+
         while (idx < frame.length && frame[idx] == 0x00) {
           idx++;
         }
-        
-        // 可选分隔符 0x0D 0x0A：仅当紧随其后才消费
-        if (idx + 1 < frame.length && frame[idx] == 0x0D && frame[idx + 1] == 0x0A) {
+
+        var dropField = false;
+        if (fieldId == 0x04) {
+          // 氢气字段必须以 0D 0A 结尾；30 30 是传输出错，剔除后继续解后面的字段
+          if (idx + 1 < frame.length && frame[idx] == 0x0D && frame[idx + 1] == 0x0A) {
+            idx += 2;
+          } else {
+            dropField = true;
+            var junk = 0;
+            while (idx < frame.length && frame[idx] == 0x30) {
+              idx++;
+              junk++;
+            }
+            if (idx + 1 < frame.length && frame[idx] == 0x0D && frame[idx + 1] == 0x0A) {
+              idx += 2;
+            }
+            print('H2结尾不是0D 0A，剔除0x30 x$junk，本字段丢弃');
+          }
+        } else if (idx + 1 < frame.length && frame[idx] == 0x0D && frame[idx + 1] == 0x0A) {
           idx += 2;
         }
-        while (idx < frame.length && frame[idx] == 0x00) idx++;
-        
-        // 根据字段ID解析数据
-        _parseFieldData(nodeId, fieldId, payload, timestamp);
+        while (idx < frame.length && frame[idx] == 0x00) {
+          idx++;
+        }
+
+        if (!dropField) {
+          _parseFieldData(nodeId, fieldId, payload, timestamp, frame);
+        }
       }
       
-      // 复合数据帧解析完成（不再主动发送，等待客户端请求）
+      // 复合数据帧解析完成：上传和 Modbus 缓存都丢到后台，立刻让出轮询线程
+      unawaited(_sendProcessedDataRS485(nodeId));
+      _modbusServer.scheduleCacheRebuild(nodeId);
     } catch (e) {
       print('解析复合数据帧失败: $e');
     }
   }
 
   // 解析字段数据
-  void _parseFieldData(int nodeId, int fieldId, List<int> payload, int timestamp) {
+  void _parseFieldData(int nodeId, int fieldId, List<int> payload, int timestamp, List<int> frame) {
     try {
       switch (fieldId) {
         case 0x02: // CO传感器
           if (payload.length >= 2) {
             final rawCo = (payload[0] << 8) | payload[1];
-            // 使用时间窗口检测过滤CO值，区分真实预警和传感器故障
-            final co = _filterCoValueWithTimeWindow(nodeId, rawCo, timestamp);
-            if (rawCo != co) {
-              print('CO值过滤: 节点=$nodeId, 原始值=$rawCo, 过滤后=$co ppm');
-            } else {
-              print('复合帧-CO: 节点=$nodeId, CO=$co ppm');
-            }
+            final co = _filterCoNeedTenSeconds(nodeId, rawCo, timestamp);
             final coData = SensorData(
               nodeId: nodeId,
               sensorType: 2, // CO_SENSOR
@@ -808,7 +762,11 @@ class SensorDataService {
             
             // 比值和报警计数
             final ratio = payload[14];
-            final alarmCount = payload[15];
+            int alarmCountRaw = payload[15];
+            if (frame.length > 0x1A) {
+              alarmCountRaw = frame[0x1A];
+            }
+            final alarmCount = alarmCountRaw > 127 ? alarmCountRaw - 256 : alarmCountRaw;
             
             // 热敏电阻A/D采样值（外部温度）
             final tempRaw = (payload[17] << 8) | payload[16];
@@ -834,38 +792,28 @@ class SensorDataService {
             
             // 构建烟雾状态：基于通道状态判断
             // 优先级：故障 > 预警 > 正常
-            int smokeStatus = 0;
+            int smokeStatus = 0x01;
             if (t0aFault || t0bFault) {
-              // 有故障显示故障
-              smokeStatus = 0x04; // 故障状态
+              smokeStatus = 0x04;
             } else if (t0aWarning || t0bWarning) {
-              // 有预警显示预警
-              smokeStatus = 0x02; // 预警状态
-            } else {
-              // 正常状态
-              smokeStatus = 0x01; // 正常状态
+              smokeStatus = 0x02;
+            }
+            // 水汽干扰：T0A/T0B 预警或报警时，看 0x1A 带符号报警计数。
+            // 负数=干扰，输出并记录正常；正数才按 T0A/T0B 输出。
+            if (smokeStatus == 0x02 || smokeStatus == 0x04) {
+              if (alarmCount <= 0) {
+                smokeStatus = 0x01;
+              }
             }
             
-            // 应用烟雾过滤
-            final filteredChannelA = _filterSmokeValueWithTimeWindow(nodeId, 'A', channelA, timestamp);
-            final filteredChannelB = _filterSmokeValueWithTimeWindow(nodeId, 'B', channelB, timestamp);
-            
-            print('复合帧-烟雾: A=$channelA B=$channelB aA=$calibA aB=$calibB TA=$threshA TB=$threshB 比=$ratio 报警=$alarmCount 温度=${tempC.toStringAsFixed(2)}');
-            print('烟雾通道状态: T0A=0x${t0a.toRadixString(16)} (标定=$t0aCalibrated, 预警=$t0aWarning, 故障=$t0aFault, 传感器=$t0aSensorStatus)');
-            print('烟雾通道状态: T0B=0x${t0b.toRadixString(16)} (标定=$t0bCalibrated, 预警=$t0bWarning, 故障=$t0bFault, 传感器=$t0bSensorStatus)');
-            print('烟雾状态判断: 最终状态=0x${smokeStatus.toRadixString(16)} (${smokeStatus == 0x04 ? '故障' : smokeStatus == 0x02 ? '预警' : '正常'})');
-            print('烟雾参数解析: calibA=0x${calibA.toRadixString(16)}($calibA), calibB=0x${calibB.toRadixString(16)}($calibB)');
-            print('烟雾参数解析: threshA=0x${threshA.toRadixString(16)}($threshA), threshB=0x${threshB.toRadixString(16)}($threshB)');
-            print('烟雾计算参数验证: channelA=$channelA, calibA=$calibA, threshA=$threshA');
-            print('烟雾计算参数验证: channelB=$channelB, calibB=$calibB, threshB=$threshB');
-            print('烟雾原始数据解析: payload[0-19]=${payload.map((b) => '0x${b.toRadixString(16).padLeft(2, '0')}').join(' ')}');
+            print('复合帧-烟雾: A=$channelA B=$channelB 报警计数=$alarmCount T0A/T0B状态=0x${smokeStatus.toRadixString(16)}');
             final smokeData = SensorData(
               nodeId: nodeId,
               sensorType: 5, // SMOKE_SENSOR
               timestamp: timestamp,
               smokeStatus: smokeStatus,
-              smokeChannelA: filteredChannelA,
-              smokeChannelB: filteredChannelB,
+              smokeChannelA: channelA,
+              smokeChannelB: channelB,
               smokeCalibA: calibA,
               smokeCalibB: calibB,
               smokeThreshA: threshA,
@@ -878,12 +826,10 @@ class SensorDataService {
           }
           break;
           
-        case 0x04: // H2传感器（表9 字段4：1字节%LEL，不做范围限制）
+        case 0x04: // H2传感器（表9 字段4：1字节%LEL）
           if (payload.length >= 1) {
             final raw = payload[0];
-            double h2 = raw.toDouble();
-            // 应用氢气过滤
-            h2 = _filterH2ValueWithTimeWindow(nodeId, h2, timestamp);
+            double h2 = raw.toDouble(); // 直接按整数%LEL解析，不做范围裁剪
             print('复合帧-H2: 原始值=$raw, 解析值=${h2.toStringAsFixed(1)}%LEL');
             final h2Data = SensorData(
               nodeId: nodeId,
@@ -912,18 +858,19 @@ class SensorDataService {
             } else {
               final signedRaw = raw > 32768 ? (raw - 65536) : raw;
               temp = signedRaw * 0.01;
-              // 精度控制：保留2位小数
-              temp = double.parse(temp.toStringAsFixed(2));
             }
             
-            // 应用温度过滤（排除开路值）
+            // 应用温度突变过滤（通道索引从0开始）
             final channelIndex = p ~/ 2;
+            double filteredTemp = temp;
             if (temp != -999.0) {
-              temp = _filterTempValueWithTimeWindow(nodeId, channelIndex, temp, timestamp);
+              filteredTemp = _filterTempValueWithTimeWindow(nodeId, channelIndex, temp, timestamp);
+              if (temp != filteredTemp) {
+                print('PT100温度过滤: 节点=$nodeId, 通道=$channelIndex, 原始值=$temp→过滤值=$filteredTemp°C');
+              }
             }
-            
-            temps.add(temp);
-            print('PT100[$p/2]: 原始=0x${raw.toRadixString(16).padLeft(4, '0')}($raw) ${raw == 0x8066 ? '开路' : '有符号=${raw > 32768 ? (raw - 65536) : raw}'} -> ${temp == -999.0 ? '开路' : '${temp.toStringAsFixed(2)}°C'}');
+            temps.add(filteredTemp);
+            print('PT100[$p/2]: 原始=0x${raw.toRadixString(16).padLeft(4, '0')}($raw) ${raw == 0x8066 ? '开路' : '有符号=${raw > 32768 ? (raw - 65536) : raw}'} -> ${filteredTemp == -999.0 ? '开路' : '${filteredTemp.toStringAsFixed(2)}°C'}');
           }
           // 确保有12个通道
           while (temps.length < 12) {
@@ -987,22 +934,18 @@ class SensorDataService {
             } else {
               temperature = tempRaw / 256.0;
             }
-            
-            // 应用压力过滤
-            pressure = _filterPressureValueWithTimeWindow(nodeId, pressure, timestamp);
-            
-            // 应用温度突变过滤（使用通道索引-2表示压力传感器温度）
-            final filteredTemp = _filterTempValueWithTimeWindow(nodeId, -2, temperature, timestamp);
-            if (temperature != filteredTemp) {
-              print('压力传感器温度过滤: 节点=$nodeId, 原始值=$temperature→过滤值=$filteredTemp°C');
+
+            final filteredPressure = _filterPressureSpike(nodeId, pressure, pRaw);
+            if (filteredPressure == null) {
+              break;
             }
             
-            print('复合帧-压力: ${pressure.toStringAsFixed(1)} kPa, 温度: ${filteredTemp.toStringAsFixed(1)}°C');
+            final filteredTemp = _filterTempValueWithTimeWindow(nodeId, -2, temperature, timestamp);
             final pressureData = SensorData(
               nodeId: nodeId,
               sensorType: 4, // PRESSURE_SENSOR
               timestamp: timestamp,
-              pressureKpa: pressure,
+              pressureKpa: filteredPressure,
               pressureTempC: filteredTemp,
             );
             _notifyDataUpdate(4, pressureData);
@@ -1017,7 +960,20 @@ class SensorDataService {
   // 解析状态帧（0x0C）
   void _parseStatusFrame(int nodeId, List<int> data) {
     try {
-      // print('解析状态帧: 节点=$nodeId');
+      print('解析状态帧: 节点=$nodeId');
+      
+      // 节点有数据接收，重置计数器并标记为已连接
+      _nodeNoResponseCount[nodeId] = 0;
+      _nodeResponseStatus[nodeId] = true;
+      
+      // 通知节点响应（如果在等待该节点的响应）
+      if (_nodeResponseCompleters.containsKey(nodeId)) {
+        final completer = _nodeResponseCompleters[nodeId];
+        if (!completer!.isCompleted) {
+          completer.complete(true);
+          print('节点$nodeId: 收到状态帧响应');
+        }
+      }
       
       // 状态帧包含各传感器的连接状态
       final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -1036,7 +992,7 @@ class SensorDataService {
       );
       
       _notifyDataUpdate(8, statusData);
-      // print('状态帧解析完成: 节点=$nodeId');
+      print('状态帧解析完成: 节点=$nodeId');
     } catch (e) {
       print('解析状态帧失败: $e');
     }
@@ -1044,140 +1000,133 @@ class SensorDataService {
 
   // 通知数据更新
   void _notifyDataUpdate(int sensorType, SensorData data) {
-    // 数据已经在_processRealSensorData中添加，这里不需要重复添加
-    // 精简日志：只在调试模式下输出详细信息
-    // print('处理传感器数据: 节点=${data.nodeId}, 类型=$sensorType, 列表长度=${_dataList.length}');
-    
-    // 增加数据处理计数器
-    _dataProcessedCount++;
-    
-    // 更新节点最后数据时间戳
-    final now = DateTime.now().millisecondsSinceEpoch;
-    _nodeLastDataTime[data.nodeId] = now;
-    _nodeLastSuccessTime[data.nodeId] = now; // 更新最后成功时间
-    
     if (_onDataUpdate != null) {
       _onDataUpdate!(sensorType, data);
-      // print('通知数据更新: 节点=${data.nodeId}, 类型=$sensorType');
+      print('通知数据更新: 节点=${data.nodeId}, 类型=$sensorType');
     }
     // 有有效数据即视为在线
     CsvLoggerService.instance.setConnectionStatus(true);
     // 聚合为节点快照，交由定时任务每秒统一写入一次
     CsvLoggerService.instance.updateNodeSnapshot(data);
-    
-    // 检查节点连接状态变化（有数据时标记为已连接）
-    _checkNodeConnectionChange(data.nodeId, true);
-    
-    // 检查故障信息
-    _checkFaultInfo(data);
-    
-      // 通知节点响应（如果在等待该节点的响应）
-      if (_nodeResponseCompleters.containsKey(data.nodeId)) {
-        final completer = _nodeResponseCompleters[data.nodeId];
-        if (!completer!.isCompleted) {
-          completer.complete(true);
-          print('节点${data.nodeId}: 收到数据帧响应');
-        }
-      }
   }
 
-  // 启动主动查询
   void _startActiveQuery() {
-    // 节点1-5轮流发送，间隔200毫秒
-    _queryTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) async {
-      if (!_isClientConnected || _currentClientSocket == null) {
-        timer.cancel();
-        return;
-      }
+    if (_pollLoopRunning) return;
+    _pollLoopRunning = true;
+    unawaited(_runPollingLoop());
+  }
 
-      // 如果正在轮询中，跳过本次
-      if (_isPolling) {
-        return;
-      }
-
-      // 节点1-5轮流发送
-      final List<int> targetIds = [1, 2, 3, 4, 5];
-      final nodeId = targetIds[_currentPollingIndex % targetIds.length];
-      _currentPollingIndex++;
-      
-      _isPolling = true;
-      try {
-        // 创建Completer等待响应
-        final completer = Completer<bool>();
-        _nodeResponseCompleters[nodeId] = completer;
-        _currentQueryingNodeId = nodeId;
-        
-        // 发送数据传送指令
-        _sendDataTransferCommand(nodeId);
-        print('节点$nodeId: 发送数据传输指令');
-        
-        // 等待响应，最多等待150毫秒
-        try {
-          final hasResponse = await completer.future.timeout(
-            const Duration(milliseconds: 150),
-            onTimeout: () {
-              print('节点$nodeId: 等待超时（150毫秒内无响应）');
-              return false;
-            },
-          );
-          
-          if (hasResponse) {
-            // 收到响应，重置计数器并标记为已连接
+  Future<void> _runPollingLoop() async {
+    _isPolling = true;
+    print('RS485轮询已启动: 节点$_pollNodeIds，等待${_firstByteTimeoutMs}ms，超时改询下一站，解析完等${_busTurnaroundMs}ms');
+    unawaited(SerialDebugLogger.instance.log(
+        '开始轮询节点$_pollNodeIds：发令后等${_firstByteTimeoutMs}ms，未收到返回则询下一节点，不补发'));
+    try {
+      while (_isConnected && _serial.isOpen) {
+        for (final nodeId in _pollNodeIds) {
+          if (!_isConnected || !_serial.isOpen) break;
+          final got = await _queryNodeOnce(nodeId);
+          if (got) {
             _nodeNoResponseCount[nodeId] = 0;
             _nodeResponseStatus[nodeId] = true;
-            print('节点$nodeId: 收到响应，标记为已连接');
           } else {
-            // 未收到响应，增加计数器
             final count = (_nodeNoResponseCount[nodeId] ?? 0) + 1;
             _nodeNoResponseCount[nodeId] = count;
-            print('节点$nodeId: 未收到响应，连续未响应次数: $count');
-            
-            // 如果连续10次未收到响应，标记为未连接
+            if (count <= 10 || count % 50 == 0) {
+              unawaited(SerialDebugLogger.instance.log(
+                  '节点$nodeId ${_firstByteTimeoutMs}ms无返回，改询下一节点，连续未响应 $count/10'));
+            }
             if (count >= 10) {
               _nodeResponseStatus[nodeId] = false;
-              print('节点$nodeId: 连续10次未收到响应，标记为未连接');
+            }
+            if (_rxBuffer.isNotEmpty &&
+                !_isFrameHeader(_rxBuffer, 0) &&
+                _rxBuffer[0] != 0xA5) {
+              _rxBuffer.clear();
             }
           }
-        } catch (e) {
-          print('节点$nodeId: 等待异常: $e');
-          // 异常也视为未收到响应
-          final count = (_nodeNoResponseCount[nodeId] ?? 0) + 1;
-          _nodeNoResponseCount[nodeId] = count;
-          if (count >= 10) {
-            _nodeResponseStatus[nodeId] = false;
-            print('节点$nodeId: 连续10次未收到响应，标记为未连接');
-          }
         }
-        
-        // 清理Completer
-        _nodeResponseCompleters.remove(nodeId);
-        _currentQueryingNodeId = null;
-      } finally {
-        _isPolling = false;
       }
-    });
+    } finally {
+      _pollLoopRunning = false;
+      _isPolling = false;
+      print('RS485轮询已停止');
+    }
+  }
+
+  Future<bool> _queryNodeOnce(int nodeId) async {
+    _gotResponseThisSlot = false;
+    _slotFrameCompleter = Completer<void>();
+    _currentQueryingNodeId = nodeId;
+    _currentPollingIndex = nodeId;
+    try {
+      await _sendDataTransferCommand(nodeId);
+      final got = await _waitForCompleteResponse();
+      if (got) {
+        await Future.delayed(const Duration(milliseconds: _busTurnaroundMs));
+      }
+      return got;
+    } finally {
+      _nodeResponseCompleters.remove(nodeId);
+      _currentQueryingNodeId = null;
+      _slotFrameCompleter = null;
+    }
   }
 
   // 对外暴露已观测到的节点（调试/使用）
   List<int> getObservedNodeIds() => _observedNodeIds.take(5).toList();
 
 
-  // 发送数据传送指令
-  void _sendDataTransferCommand(int nodeId) {
+  Future<bool> _waitUntil(bool Function() test, {required int timeoutMs}) async {
+    final end = DateTime.now().add(Duration(milliseconds: timeoutMs));
+    while (DateTime.now().isBefore(end)) {
+      if (test()) return true;
+      await Future.delayed(const Duration(milliseconds: 5));
+    }
+    return test();
+  }
+
+  Future<bool> _waitForCompleteResponse() async {
+    final started = await _waitUntil(
+      () => _gotResponseThisSlot || _hasIncomingResponse(),
+      timeoutMs: _firstByteTimeoutMs,
+    );
+    if (_gotResponseThisSlot) {
+      return true;
+    }
+    if (!started) {
+      return false;
+    }
+
+    final waiter = _slotFrameCompleter;
+    if (waiter != null && !waiter.isCompleted) {
+      try {
+        await waiter.future.timeout(const Duration(milliseconds: _completeFrameTimeoutMs));
+      } on TimeoutException {
+        unawaited(SerialDebugLogger.instance.log(
+            '已开始接收但${_completeFrameTimeoutMs}ms仍未收齐，缓冲=${_rxBuffer.length}字节'));
+      }
+    }
+    return _gotResponseThisSlot;
+  }
+
+  Future<void> _sendDataTransferCommand(int nodeId) async {
     try {
-      if (_currentClientSocket == null) return;
-      
+      if (!_serial.isOpen) return;
+
       // 根据HarmonyOS协议：A5 [addr] 0D 0A 00 + CRC16
       final payload = [0xA5, nodeId, 0x0D, 0x0A, 0x00];
       final crc = _calculateCRC16(payload);
       final frame = [...payload, crc & 0xFF, (crc >> 8) & 0xFF];
-      
-      _currentClientSocket!.add(frame);
-      
-      // 保存发送的指令（发送一次记录一次）
-      unawaited(CsvLoggerService.instance.saveDataTransferLog(nodeId, '发送', frame, DateTime.now()));
-      
-      // print('发送数据传送指令到节点$nodeId: ${frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}');
+      _lastTxHex = frame.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      _lastTxTargetNode = nodeId;
+
+      final wrote = await _serial.write(frame);
+      SerialDebugLogger.instance.logTx(frame, nodeId: nodeId);
+      CsvLoggerService.instance.saveDataTransferLog(nodeId, '发送', frame, DateTime.now());
+      if (!wrote) {
+        unawaited(SerialDebugLogger.instance.log('节点$nodeId 串口write返回失败'));
+      }
     } catch (e) {
       print('发送数据传送指令失败: $e');
     }
@@ -1200,39 +1149,19 @@ class SensorDataService {
   }
 
 
-  // 停止数据接收
   void stopReceiving() {
     _isConnected = false;
     _isClientConnected = false;
     _connectionStatus = '已停止';
     _stopNetworkMonitoring();
-    
-    // 停止查询定时器
     _queryTimer?.cancel();
     _queryTimer = null;
-    
-    // 停止每分钟数据保存定时器
-    _minuteDataTimer?.cancel();
-    _minuteDataTimer = null;
-    
-    // 停止Modbus TCP服务器
-    _modbusServer.stop();
-    
-    // 停止AlertService的Modbus TCP连接
-    _alertService.stopModbusConnection();
-    
-    // 停止汇总定时器
-    _summaryTimer?.cancel();
-    _summaryTimer = null;
-    
-    // 关闭客户端连接
-    _currentClientSocket?.close();
-    _currentClientSocket = null;
-    
-    // 关闭TCP服务器
-    _tcpServer?.close();
-    _tcpServer = null;
-    
+    _rxIdleTimer?.cancel();
+    _rxIdleTimer = null;
+    unawaited(_serial.stop());
+    _rxBuffer.clear();
+    _modbusClient.stopConnectionMonitoring();
+    BackgroundCpuService.instance.stop();
     print('传感器服务已停止');
   }
 
@@ -1268,9 +1197,8 @@ class SensorDataService {
       
       print('Created SensorData with PT100: ${sensorData.pt100Temperatures}');
       
-      // 存储数据到列表
+      // 存储数据
       _dataList.add(sensorData);
-      print('📝 数据已添加到列表: 节点${sensorData.nodeId}, 类型=$sensorType, 当前列表长度=${_dataList.length}');
       
       // 通知数据更新
       if (_onDataUpdate != null) {
@@ -1287,67 +1215,13 @@ class SensorDataService {
       ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
   }
 
-  // 获取温度历史正常值（用于节点详细页面计算）
-  // 如果当前值异常，返回该通道最近的历史正常值
-  double? getTempHistoryValue(int nodeId, int channelIndex, double currentValue) {
-    // 检查当前值是否异常（超出合理范围）
-    if (currentValue < -50 || currentValue > 200 || currentValue == -999) {
-      final historyKey = '${nodeId}_$channelIndex';
-      final history = _tempHistory[historyKey];
-      if (history != null && history.isNotEmpty) {
-        // 返回最近的有效值
-        return history.last.value;
-      }
-      // 没有历史值，返回null（让调用者决定使用什么默认值）
-      return null;
-    }
-    // 当前值正常，返回null（使用当前值）
-    return null;
-  }
-
   // 获取连接状态
   bool isConnected() => _isConnected;
   bool isClientConnected() => _isClientConnected;
   String getConnectionStatus() => _connectionStatus;
   
-  // 获取节点连接状态（基于查询判断逻辑）
-  bool isNodeConnected(int nodeId) {
-    // 从节点连接状态映射中获取
-    final connectionState = _nodeConnectionStates[nodeId] ?? false;
-    
-    // 如果状态为未连接，直接返回false
-    if (!connectionState) {
-      return false;
-    }
-    
-    // 如果状态为已连接，再检查最后一次成功时间
-    final lastSuccessTime = _nodeLastSuccessTime[nodeId] ?? 0;
-    if (lastSuccessTime == 0) {
-      return false;
-    }
-    
-    // 检查距离最后一次成功是否超过配置的超时时间
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final timeSinceLastSuccess = now - lastSuccessTime;
-    final disconnectTimeoutMs = _settingsService.nodeDisconnectTimeoutMs;
-    
-    // 只有距离最后一次成功未超过超时时间，才认为已连接
-    return timeSinceLastSuccess < disconnectTimeoutMs;
-  }
-  
   // 获取网络连接状态
   bool isNetworkConnected() => _isNetworkAvailable;
-
-  // 获取Modbus TCP服务器连接状态
-  bool isModbusServerConnected() => _modbusServer.isRunning;
-
-  // 检测Modbus TCP服务器连接
-  Future<bool> checkModbusServerConnection() async {
-    return _modbusServer.isRunning;
-  }
-
-  // 获取Modbus TCP服务器信息
-  String getModbusServerInfo() => 'Modbus TCP服务器: 端口${_modbusServer.listenPort}, 客户端数: ${_modbusServer.clientCount}';
 
   // 获取运行时统计
   String getRuntimeStats() {
@@ -1369,7 +1243,6 @@ class SensorDataService {
   // 重置所有数据
   Future<Map<String, int>> resetAllData() async {
     try {
-      print('⚠️ 重置所有数据被调用！当前数据列表长度: ${_dataList.length}');
       _dataList.clear();
       _rxPackets = 0;
       _rxBytes = 0;
@@ -1387,164 +1260,138 @@ class SensorDataService {
     }
   }
 
-  // 发送状态查询命令
+  // 发送状态查询命令（已废弃，改为发送数据传送指令）
   void sendStatusQueryCommand(int nodeId) {
     try {
-      print('发送状态查询命令到节点 $nodeId');
-      // 这里应该实现真实的命令发送逻辑
-      // 目前只是打印日志
+      print('发送状态查询命令到节点 $nodeId（已改为发送数据传送指令）');
+      // 新的逻辑只发送数据传送指令，不再发送状态查询指令
+      _sendDataTransferCommand(nodeId);
     } catch (e) {
       print('发送状态查询命令失败: $e');
     }
   }
 
-  // 启动每秒汇总日志
-  void _startSummaryTimer() {
-    _summaryTimer?.cancel();
-    _summaryTimer = Timer.periodic(Duration(seconds: 1), (timer) {
-      if (_dataProcessedCount > 0) {
-        print('📊 数据处理汇总: 本秒处理了$_dataProcessedCount条数据，当前数据列表长度: ${_dataList.length}');
-        _dataProcessedCount = 0; // 重置计数器
-      }
-    });
-    print('每秒汇总日志已启动');
+  // 发送历史数据到远端服务器（每分钟 CSV 落盘后）
+  void _sendHistoryDataToServer(dynamic data, {int? nodeId}) {
+    unawaited(_uploadHistoryData(data, nodeId: nodeId));
   }
 
-
-
-
-  // 获取节点的最新数据
-  SensorData? _getLatestNodeData(int nodeId) {
-    print('🔍 查询节点${nodeId}的最新数据...');
-    
-    // 直接从当前存储的数据中获取最新数据
-    // 查找该节点的最新数据
-    SensorData? latestData;
-    int? latestTimestamp;
-    
-    for (final data in _dataList) {
-      if (data.nodeId == nodeId) {
-        if (latestTimestamp == null || data.timestamp > latestTimestamp) {
-          latestData = data;
-          latestTimestamp = data.timestamp;
-        }
-      }
-    }
-    
-    if (latestData != null) {
-      print('✅ 找到节点${nodeId}的最新数据: ${latestData.timestamp}');
-      return latestData;
-    } else {
-      print('⚠️ 节点${nodeId}暂无数据');
-      return null;
-    }
-  }
-
-  // 发送Modbus TCP连接状态变化（已废弃，不再主动发送）
-  void _sendModbusConnectionChange(bool isConnected) {
-    // 不再主动发送连接状态变化，等待客户端请求
-    print('Modbus TCP连接状态变化: $isConnected (不再主动发送)');
-  }
-
-  // 检查节点连接状态变化（带状态确认机制，避免频繁切换）
-  void _checkNodeConnectionChange(int nodeId, bool isConnected) {
-    final wasConnected = _nodeConnectionStates[nodeId] ?? false;
-    
-    if (isConnected) {
-      // 标记为已连接：立即生效（有数据证明已连接）
-      if (!wasConnected) {
-        _nodeConnectionStates[nodeId] = true;
-        _nodeLastSuccessTime[nodeId] = DateTime.now().millisecondsSinceEpoch;
-      
-      final timestamp = DateTime.now().toIso8601String();
-      // 不再主动发送节点连接状态变化
-      print('节点$nodeId连接状态变化: $isConnected (不再主动发送)');
-      // _modbusClient.sendNodeConnectionChange(
-      //   nodeId: nodeId,
-      //   isConnected: true,
-      //   timestamp: timestamp,
-      // );
-      
-      print('节点$nodeId连接状态变化: 已连接');
+  Future<void> _uploadHistoryData(dynamic data, {int? nodeId}) async {
+    try {
+      Map<String, dynamic> sensorData;
+      var nid = nodeId ?? 0;
+      if (data is Map<String, dynamic>) {
+        sensorData = data;
+        nid = nid > 0 ? nid : (data['node_id'] as int? ?? 0);
+      } else if (data is SensorData) {
+        nid = nid > 0 ? nid : data.nodeId;
+        sensorData = data.toMap();
       } else {
-        // 已连接状态下收到数据，更新最后成功时间
-        _nodeLastSuccessTime[nodeId] = DateTime.now().millisecondsSinceEpoch;
+        return;
       }
-    } else {
-      // 标记为未连接：需要确认机制，避免短暂延迟导致的误判
-      if (wasConnected) {
-        final lastSuccessTime = _nodeLastSuccessTime[nodeId] ?? 0;
-        final now = DateTime.now().millisecondsSinceEpoch;
-        final timeSinceLastSuccess = now - lastSuccessTime;
-        
-        // 从设置服务获取断开连接判断超时时间（默认10秒）
-        final disconnectTimeoutMs = _settingsService.nodeDisconnectTimeoutMs;
-        
-        // 只有在距离最后一次成功超过配置的超时时间，才真正标记为未连接
-        // 这样可以避免因短暂的数据延迟导致频繁切换
-        if (timeSinceLastSuccess >= disconnectTimeoutMs) {
-          _nodeConnectionStates[nodeId] = false;
-          
-          final timestamp = DateTime.now().toIso8601String();
-          // 不再主动发送节点连接状态变化
-    print('节点$nodeId连接状态变化: $isConnected (不再主动发送)');
-    // _modbusClient.sendNodeConnectionChange(
-    //   nodeId: nodeId,
-    //   isConnected: false,
-    //   timestamp: timestamp,
-    // );
-    
-    print('节点$nodeId连接状态变化: 已断开 (距离最后成功: ${timeSinceLastSuccess}ms >= ${disconnectTimeoutMs}ms)');
-        } else {
-          // 还在保护期内，不切换状态，但记录日志
-          print('节点$nodeId 无响应但仍在保护期内 (距离最后成功: ${timeSinceLastSuccess}ms < ${disconnectTimeoutMs}ms)，保持已连接状态');
-        }
-      }
+      if (nid < 1) return;
+      final ok = await _modbusClient.sendMinuteHistoryData(
+        nodeId: nid,
+        sensorData: sensorData,
+        timestamp: DateTime.now().toIso8601String(),
+      );
+      unawaited(SerialDebugLogger.instance.log(
+          ok ? '[上传] 节点$nid 分钟历史已发 ${_modbusClient.serverInfo}'
+             : '[上传] 节点$nid 分钟历史失败 ${_modbusClient.serverInfo}'));
+    } catch (e) {
+      print('上传历史数据失败: $e');
     }
   }
 
-  // 发送历史数据到远端服务器（已废弃，不再主动发送）
-  void _sendHistoryDataToServer(dynamic data) {
-    // 不再主动发送历史数据，等待客户端请求
-    print('历史数据已准备: 节点${data.nodeId} (不再主动发送)');
-    return;
-    // if (!_modbusServer.isRunning) {
-    //   print('⚠️ Modbus TCP服务器未运行，跳过历史数据发送');
-    //   return;
-    // }
-    
-    final timestamp = DateTime.now().toIso8601String();
-    
-    // 判断数据类型：如果是SensorData，转换为Map；如果已经是Map，直接使用
-    Map<String, dynamic> sensorDataMap;
-    int nodeId;
-    
-    if (data is SensorData) {
-      sensorDataMap = data.toMap();
-      nodeId = data.nodeId;
-    } else if (data is Map<String, dynamic>) {
-      sensorDataMap = data;
-      nodeId = data['node_id'] as int? ?? 0;
-    } else {
-      print('❌ 未知的数据类型: ${data.runtimeType}');
-      return;
+  int _filterCoNeedTenSeconds(int nodeId, int rawCo, int timestamp) {
+    if (rawCo < 0 || rawCo > 10000) {
+      return _coStableValues[nodeId] ?? 0;
     }
-    
-    print('📤 发送完整历史数据到远端服务器: 节点$nodeId');
-    print('📊 历史数据包含字段: ${sensorDataMap.keys.join(', ')}');
-    
-    // 不再主动发送历史数据，等待客户端请求
-    print('历史数据已准备: 节点$nodeId (不再主动发送)');
-    // _modbusClient.sendMinuteHistoryData(
-    //   nodeId: nodeId,
-    //   sensorData: sensorDataMap,
-    //   timestamp: timestamp,
-    // );
+    if (rawCo == 0) {
+      _coStableValues[nodeId] = 0;
+      _coPendingValues.remove(nodeId);
+      _coPendingSince.remove(nodeId);
+      return 0;
+    }
+    final last = _coStableValues[nodeId];
+    if (last == null) {
+      if (rawCo <= 50) {
+        _coStableValues[nodeId] = rawCo;
+        return rawCo;
+      }
+      _coStableValues[nodeId] = 0;
+      _coPendingValues[nodeId] = rawCo;
+      _coPendingSince[nodeId] = timestamp;
+      return 0;
+    }
+    if ((rawCo - last).abs() <= 50) {
+      _coStableValues[nodeId] = rawCo;
+      _coPendingValues.remove(nodeId);
+      _coPendingSince.remove(nodeId);
+      return rawCo;
+    }
+    final pending = _coPendingValues[nodeId];
+    final since = _coPendingSince[nodeId];
+    if (pending != null && since != null && (rawCo - pending).abs() <= 100) {
+      if (timestamp - since >= 10000) {
+        _coStableValues[nodeId] = rawCo;
+        _coPendingValues.remove(nodeId);
+        _coPendingSince.remove(nodeId);
+        print('CO确认: 节点=$nodeId ${pending}ppm 已持续10秒，采纳 $rawCo');
+        return rawCo;
+      }
+      return last;
+    }
+    _coPendingValues[nodeId] = rawCo;
+    _coPendingSince[nodeId] = timestamp;
+    print('CO观察: 节点=$nodeId 从${last}跳到$rawCo，10秒内当误报');
+    return last;
+  }
+
+  bool _isPressureNoise(int pRaw, double kpa) {
+    if (pRaw == 0 || pRaw == 0xFFFFFF) return true;
+    if ((pRaw >> 16) >= 0xF0) return true;
+    if (kpa < 0) return true;
+    return false;
+  }
+
+  double? _filterPressureSpike(int nodeId, double raw, int pRaw) {
+    if (_isPressureNoise(pRaw, raw)) {
+      return _pressureLastGood[nodeId];
+    }
+    final window = _pressureWindow.putIfAbsent(nodeId, () => <double>[]);
+    if (window.length >= 3) {
+      final sorted = [...window]..sort();
+      final median = sorted[sorted.length ~/ 2];
+      if ((raw - median).abs() > 20) {
+        return _pressureLastGood[nodeId] ?? median;
+      }
+    }
+    window.add(raw);
+    if (window.length > 5) {
+      window.removeAt(0);
+    }
+    final sorted = [...window]..sort();
+    final median = sorted[sorted.length ~/ 2];
+    _pressureLastGood[nodeId] = median;
+    return median;
   }
 
   // CO值时间窗口过滤方法
   // 使用时间窗口检测区分真实预警和传感器故障
   int _filterCoValueWithTimeWindow(int nodeId, int rawCo, int timestamp) {
+    // 0. 特殊处理：原始值=0 时优先认为是安全/恢复状态，避免长时间黏住之前的高值
+    //    这样一旦传感器数据恢复为 0，就立刻让显示/报警恢复为 0，而不是继续沿用 512 之类的历史异常值
+    if (rawCo == 0) {
+      // 清理该节点正在观察的突变状态
+      _coSpikeStates.remove(nodeId);
+
+      // 记录新的 0 值到历史
+      final history = _coHistory.putIfAbsent(nodeId, () => <CoHistoryEntry>[]);
+      history.add(CoHistoryEntry(0, timestamp));
+      return 0;
+    }
+
     // 1. 基本范围检查：负数或超过10000ppm认为无效
     if (rawCo < 0 || rawCo > 10000) {
       print('CO基本范围检查: 节点=$nodeId, 原始值=$rawCo超出范围[0, 10000]');
@@ -1557,6 +1404,32 @@ class SensorDataService {
       }
       // 没有历史值，返回0
       return 0;
+    }
+    
+    // 1.5. 高值异常检测：如果CO值突然跳到很高的值（>1000ppm），需要更严格的验证
+    // 这可能是传感器故障或数据解析错误（正常环境CO浓度通常在0-50ppm）
+    final existingHistory = _coHistory[nodeId];
+    if (existingHistory != null && existingHistory.isNotEmpty) {
+      final lastEntry = existingHistory.last;
+      final lastValue = lastEntry.value;
+      
+      // 如果从正常值（<100ppm）突然跳到高值（>1000ppm），可能是异常
+      // 特别是5000这样的异常高值，很可能是传感器故障
+      if (lastValue < 100 && rawCo > 1000) {
+        print('CO高值异常检测: 节点=$nodeId, 从正常值$lastValue突然跳到高值$rawCo ppm，可能是传感器故障，使用历史值');
+        // 继续使用之前的正常值，不更新历史记录
+        return lastValue;
+      }
+      
+      // 如果之前的值也是高值（>1000），但当前值更高（比如从2000跳到5000），也可能是异常
+      if (lastValue > 1000 && rawCo > lastValue + 2000) {
+        print('CO高值异常检测: 节点=$nodeId, 从高值$lastValue跳到异常高值$rawCo ppm，可能是传感器故障，使用历史值');
+        return lastValue;
+      }
+    } else if (rawCo > 1000) {
+      // 如果没有历史数据，但首次读取就是高值（>1000），可能是传感器故障
+      // 但为了不误判，这里只记录日志，不直接过滤
+      print('CO高值警告: 节点=$nodeId, 首次读取到高值$rawCo ppm，请检查传感器是否正常');
     }
     
     // 2. 获取历史记录
@@ -1581,21 +1454,6 @@ class SensorDataService {
     
     if (spikeState != null) {
       // 正在观察一个突变状态
-      
-      // 检查突变值是否超过固定范围（具体数值范围）
-      final fixedRange = 500.0; // 固定范围：500ppm
-      final spikeAbsValue = rawCo.abs();
-      final previousAbsValue = spikeState.previousValue.abs();
-      
-      // 如果当前突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('CO观察期内突变值超过固定范围: 节点=$nodeId, 当前值=$rawCo, 异常前值=${spikeState.previousValue}, 固定范围=$fixedRange, 使用异常前值');
-        // 清除突变状态
-        _coSpikeStates.remove(nodeId);
-        // 使用异常前的值
-        history.add(CoHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
       
       // 检查是否是传感器故障（突变后很快恢复）
       if (spikeState.isSensorFault(rawCo, timestamp)) {
@@ -1632,20 +1490,6 @@ class SensorDataService {
     final isSpike = absDiff > 100 || (relativeDiff > 0.5 && absDiff > 50);
     
     if (isSpike && rawCo > lastValue) {
-      // 检测到向上突变，检查是否超过固定范围
-      // 固定范围：500ppm（具体数值范围）
-      final fixedRange = 500.0; // 固定范围：500ppm
-      final spikeAbsValue = rawCo.abs();
-      final previousAbsValue = lastValue.abs();
-      
-      // 如果突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('CO突变值超过固定范围: 节点=$nodeId, 突变值=$rawCo, 异常前值=$lastValue, 固定范围=$fixedRange, 使用异常前值');
-        // 不创建突变状态，直接使用异常前的值
-        history.add(CoHistoryEntry(lastValue, timestamp));
-        return lastValue;
-      }
-      
       // 检测到向上突变，开始观察
       print('CO突变检测: 节点=$nodeId, 检测到突变: 从$lastValue到$rawCo (变化: ${(relativeDiff * 100).toStringAsFixed(1)}%)');
       
@@ -1671,524 +1515,14 @@ class SensorDataService {
     return rawCo;
   }
 
-  // 温度值时间窗口过滤方法
-  // 使用时间窗口检测区分真实预警和传感器故障
   double _filterTempValueWithTimeWindow(int nodeId, int channelIndex, double rawTemp, int timestamp) {
-    // 1. 基本范围检查：温度值超出合理范围（-50°C以下）认为无效（去掉上限）
-    if (rawTemp < -50) {
-      print('温度基本范围检查: 节点=$nodeId, 通道=$channelIndex, 原始值=$rawTemp超出范围[-50, +∞]');
-      // 如果有历史值，返回最近的有效值
-      final historyKey = '${nodeId}_$channelIndex';
-      final history = _tempHistory[historyKey];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last.value;
-        print('温度使用历史值: 节点=$nodeId, 通道=$channelIndex, 使用最近有效值=$lastValidValue°C');
-        return lastValidValue;
-      }
-      // 没有历史值，返回25°C（默认值）
-      return 25.0;
+    final key = '${nodeId}_$channelIndex';
+    final filter = _tempFilters.putIfAbsent(key, () => TempChannelFilter());
+    final filtered = filter.filter(rawTemp);
+    if (filtered != rawTemp) {
+      print('温度滤波: 节点=$nodeId 通道=$channelIndex $rawTemp→$filtered°C');
     }
-    
-    // 2. 获取历史记录
-    final historyKey = '${nodeId}_$channelIndex';
-    final history = _tempHistory.putIfAbsent(historyKey, () => <TempHistoryEntry>[]);
-    
-    // 3. 清理过期历史记录（只保留最近3秒的数据）
-    final expireTime = timestamp - 3000; // 3秒
-    history.removeWhere((entry) => entry.timestamp < expireTime);
-    
-    // 4. 如果没有历史数据，直接使用当前值并记录
-    if (history.isEmpty) {
-      history.add(TempHistoryEntry(rawTemp, timestamp));
-      return rawTemp;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastEntry = history.last;
-    final lastValue = lastEntry.value;
-    
-    // 6. 检查是否存在正在观察的突变状态
-    final spikeState = _tempSpikeStates[historyKey];
-    
-    if (spikeState != null) {
-      // 正在观察一个突变状态
-      
-      // 检查突变值是否超过固定范围（具体数值范围）
-      // 固定范围：±10°C（具体数值范围）
-      final fixedRange = 10.0; // 固定范围：±10°C
-      final previousValue = spikeState.previousValue;
-      
-      // 如果当前突变值超过异常值前的数值的±10°C范围，使用异常前的值
-      if (rawTemp > previousValue + fixedRange || rawTemp < previousValue - fixedRange) {
-        print('温度观察期内突变值超过固定范围: 节点=$nodeId, 通道=$channelIndex, 当前值=$rawTemp, 异常前值=$previousValue, 固定范围=±$fixedRange°C, 使用异常前值');
-        // 清除突变状态
-        _tempSpikeStates.remove(historyKey);
-        // 使用异常前的值
-        history.add(TempHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查是否是传感器故障（突变后很快恢复）
-      if (spikeState.isSensorFault(rawTemp, timestamp)) {
-        print('温度传感器故障检测: 节点=$nodeId, 通道=$channelIndex, 突变值=${spikeState.spikeValue}, 当前值=$rawTemp, 已恢复到${spikeState.previousValue}附近，判定为传感器故障');
-        // 清除突变状态
-        _tempSpikeStates.remove(historyKey);
-        // 使用之前的正常值
-        history.add(TempHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查突变是否稳定（在1-2秒内保持在一定范围内）
-      if (spikeState.isStableSpike(rawTemp, timestamp)) {
-        print('温度稳定突变检测: 节点=$nodeId, 通道=$channelIndex, 突变值=${spikeState.spikeValue}在观察期内保持稳定，判定为真实预警/故障');
-        // 清除突变状态，确认是真实的值
-        _tempSpikeStates.remove(historyKey);
-        // 使用突变后的值（真实预警/故障）
-        history.add(TempHistoryEntry(rawTemp, timestamp));
-        return rawTemp;
-      }
-      
-      // 还在观察期内，继续收集数据
-      spikeState.spikeWindow.add(rawTemp);
-      // 暂时使用之前的正常值，等待观察期结束
-      return spikeState.previousValue;
-    }
-    
-    // 7. 检测是否发生突变
-    // 突变定义为：值突然变化超过阈值（正负10°C）
-    final absDiff = (rawTemp - lastValue).abs();
-    
-    // 突变阈值：绝对值变化超过10°C
-    final isSpike = absDiff > 10.0;
-    
-    if (isSpike) {
-      // 检测到突变（向上或向下），检查是否超过固定范围
-      // 固定范围：±10°C（具体数值范围）
-      final fixedRange = 10.0; // 固定范围：±10°C
-      
-      // 如果突变值超过异常值前的数值的±10°C范围，使用异常前的值
-      if (rawTemp > lastValue + fixedRange || rawTemp < lastValue - fixedRange) {
-        print('温度突变值超过固定范围: 节点=$nodeId, 通道=$channelIndex, 突变值=$rawTemp, 异常前值=$lastValue, 固定范围=±$fixedRange°C, 使用异常前值');
-        // 不创建突变状态，直接使用异常前的值
-        history.add(TempHistoryEntry(lastValue, timestamp));
-        return lastValue;
-      }
-      
-      // 检测到突变（向上或向下），开始观察
-      print('温度突变检测: 节点=$nodeId, 通道=$channelIndex, 检测到突变: 从$lastValue到$rawTemp (变化=${absDiff.toStringAsFixed(1)}°C)');
-      
-      // 创建突变状态并开始观察
-      _tempSpikeStates[historyKey] = TempSpikeState(
-        spikeValue: rawTemp,
-        spikeTimestamp: timestamp,
-        previousValue: lastValue,
-      );
-      
-      // 暂时使用之前的正常值，等待观察期结束再决定
-      return lastValue;
-    }
-    
-    // 8. 正常变化（非突变），直接使用当前值
-    history.add(TempHistoryEntry(rawTemp, timestamp));
-    
-    // 限制历史记录长度（最多保留20个）
-    if (history.length > 20) {
-      history.removeAt(0);
-    }
-    
-    return rawTemp;
-  }
-
-  // 压力值时间窗口过滤方法
-  // 使用时间窗口检测区分真实预警和传感器故障
-  double _filterPressureValueWithTimeWindow(int nodeId, double rawPressure, int timestamp) {
-    // 1. 基本范围检查：压力值超出合理范围（0-1000kPa）认为无效
-    if (rawPressure < 0 || rawPressure > 1000) {
-      print('压力基本范围检查: 节点=$nodeId, 原始值=$rawPressure超出范围[0, 1000]');
-      // 如果有历史值，返回最近的有效值
-      final history = _pressureHistory[nodeId];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last.value;
-        print('压力使用历史值: 节点=$nodeId, 使用最近有效值=$lastValidValue kPa');
-        return lastValidValue;
-      }
-      // 没有历史值，返回100kPa（默认值）
-      return 100.0;
-    }
-    
-    // 2. 获取历史记录
-    final history = _pressureHistory.putIfAbsent(nodeId, () => <PressureHistoryEntry>[]);
-    
-    // 3. 清理过期历史记录（只保留最近3秒的数据）
-    final expireTime = timestamp - 3000; // 3秒
-    history.removeWhere((entry) => entry.timestamp < expireTime);
-    
-    // 4. 如果没有历史数据，直接使用当前值并记录
-    if (history.isEmpty) {
-      history.add(PressureHistoryEntry(rawPressure, timestamp));
-      return rawPressure;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastEntry = history.last;
-    final lastValue = lastEntry.value;
-    
-    // 6. 检查是否存在正在观察的突变状态
-    final spikeState = _pressureSpikeStates[nodeId];
-    
-    if (spikeState != null) {
-      // 正在观察一个突变状态
-      
-      // 检查突变值是否超过固定范围（具体数值范围）
-      // 固定范围：100kPa（具体数值范围）
-      final fixedRange = 100.0; // 固定范围：100kPa
-      final spikeAbsValue = rawPressure.abs();
-      final previousAbsValue = spikeState.previousValue.abs();
-      
-      // 如果当前突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('压力观察期内突变值超过固定范围: 节点=$nodeId, 当前值=$rawPressure, 异常前值=${spikeState.previousValue}, 固定范围=$fixedRange, 使用异常前值');
-        // 清除突变状态
-        _pressureSpikeStates.remove(nodeId);
-        // 使用异常前的值
-        history.add(PressureHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查是否是传感器故障（突变后很快恢复）
-      if (spikeState.isSensorFault(rawPressure, timestamp)) {
-        print('压力传感器故障检测: 节点=$nodeId, 突变值=${spikeState.spikeValue}, 当前值=$rawPressure, 已恢复到${spikeState.previousValue}附近，判定为传感器故障');
-        // 清除突变状态
-        _pressureSpikeStates.remove(nodeId);
-        // 使用之前的正常值
-        history.add(PressureHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查突变是否稳定（在1-2秒内保持在一定范围内）
-      if (spikeState.isStableSpike(rawPressure, timestamp)) {
-        print('压力稳定突变检测: 节点=$nodeId, 突变值=${spikeState.spikeValue}在观察期内保持稳定，判定为真实预警/故障');
-        // 清除突变状态，确认是真实的值
-        _pressureSpikeStates.remove(nodeId);
-        // 使用突变后的值（真实预警/故障）
-        history.add(PressureHistoryEntry(rawPressure, timestamp));
-        return rawPressure;
-      }
-      
-      // 还在观察期内，继续收集数据
-      spikeState.spikeWindow.add(rawPressure);
-      // 暂时使用之前的正常值，等待观察期结束
-      return spikeState.previousValue;
-    }
-    
-    // 7. 检测是否发生突变
-    // 突变定义为：值突然增大超过阈值（相对变化超过50%或绝对值变化超过20kPa）
-    final absDiff = (rawPressure - lastValue).abs();
-    final relativeDiff = lastValue.abs() > 0.1 ? (absDiff / lastValue.abs()) : 0;
-    
-    // 突变阈值：绝对值变化超过20kPa 或 相对变化超过50%
-    final isSpike = absDiff > 20.0 || (relativeDiff > 0.5 && absDiff > 10.0);
-    
-    if (isSpike && rawPressure > lastValue) {
-      // 检测到向上突变，检查是否超过固定范围
-      // 固定范围：100kPa（具体数值范围）
-      final fixedRange = 100.0; // 固定范围：100kPa
-      final spikeAbsValue = rawPressure.abs();
-      final previousAbsValue = lastValue.abs();
-      
-      // 如果突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('压力突变值超过固定范围: 节点=$nodeId, 突变值=$rawPressure, 异常前值=$lastValue, 固定范围=$fixedRange, 使用异常前值');
-        // 不创建突变状态，直接使用异常前的值
-        history.add(PressureHistoryEntry(lastValue, timestamp));
-        return lastValue;
-      }
-      
-      // 检测到向上突变，开始观察
-      print('压力突变检测: 节点=$nodeId, 检测到突变: 从$lastValue到$rawPressure (变化: ${(relativeDiff * 100).toStringAsFixed(1)}%)');
-      
-      // 创建突变状态并开始观察
-      _pressureSpikeStates[nodeId] = TempSpikeState(
-        spikeValue: rawPressure,
-        spikeTimestamp: timestamp,
-        previousValue: lastValue,
-      );
-      
-      // 暂时使用之前的正常值，等待观察期结束再决定
-      return lastValue;
-    }
-    
-    // 8. 正常变化（非突变），直接使用当前值
-    history.add(PressureHistoryEntry(rawPressure, timestamp));
-    
-    // 限制历史记录长度（最多保留20个）
-    if (history.length > 20) {
-      history.removeAt(0);
-    }
-    
-    return rawPressure;
-  }
-
-  // 氢气值时间窗口过滤方法
-  // 使用时间窗口检测区分真实预警和传感器故障
-  double _filterH2ValueWithTimeWindow(int nodeId, double rawH2, int timestamp) {
-    // 1. 基本范围检查：氢气值超出合理范围（0-100%LEL）认为无效
-    if (rawH2 < 0 || rawH2 > 100) {
-      print('氢气基本范围检查: 节点=$nodeId, 原始值=$rawH2超出范围[0, 100]');
-      // 如果有历史值，返回最近的有效值
-      final history = _h2History[nodeId];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last.value;
-        print('氢气使用历史值: 节点=$nodeId, 使用最近有效值=$lastValidValue %LEL');
-        return lastValidValue;
-      }
-      // 没有历史值，返回0
-      return 0.0;
-    }
-    
-    // 2. 获取历史记录
-    final history = _h2History.putIfAbsent(nodeId, () => <H2HistoryEntry>[]);
-    
-    // 3. 清理过期历史记录（只保留最近3秒的数据）
-    final expireTime = timestamp - 3000; // 3秒
-    history.removeWhere((entry) => entry.timestamp < expireTime);
-    
-    // 4. 如果没有历史数据，直接使用当前值并记录
-    if (history.isEmpty) {
-      history.add(H2HistoryEntry(rawH2, timestamp));
-      return rawH2;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastEntry = history.last;
-    final lastValue = lastEntry.value;
-    
-    // 6. 检查是否存在正在观察的突变状态
-    final spikeState = _h2SpikeStates[nodeId];
-    
-    if (spikeState != null) {
-      // 正在观察一个突变状态
-      
-      // 检查突变值是否超过固定范围（具体数值范围）
-      // 固定范围：10%LEL（具体数值范围）
-      final fixedRange = 10.0; // 固定范围：10%LEL
-      final spikeAbsValue = rawH2.abs();
-      final previousAbsValue = spikeState.previousValue.abs();
-      
-      // 如果当前突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('氢气观察期内突变值超过固定范围: 节点=$nodeId, 当前值=$rawH2, 异常前值=${spikeState.previousValue}, 固定范围=$fixedRange, 使用异常前值');
-        // 清除突变状态
-        _h2SpikeStates.remove(nodeId);
-        // 使用异常前的值
-        history.add(H2HistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查是否是传感器故障（突变后很快恢复）
-      if (spikeState.isSensorFault(rawH2, timestamp)) {
-        print('氢气传感器故障检测: 节点=$nodeId, 突变值=${spikeState.spikeValue}, 当前值=$rawH2, 已恢复到${spikeState.previousValue}附近，判定为传感器故障');
-        // 清除突变状态
-        _h2SpikeStates.remove(nodeId);
-        // 使用之前的正常值
-        history.add(H2HistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查突变是否稳定（在1-2秒内保持在一定范围内）
-      if (spikeState.isStableSpike(rawH2, timestamp)) {
-        print('氢气稳定突变检测: 节点=$nodeId, 突变值=${spikeState.spikeValue}在观察期内保持稳定，判定为真实预警/故障');
-        // 清除突变状态，确认是真实的值
-        _h2SpikeStates.remove(nodeId);
-        // 使用突变后的值（真实预警/故障）
-        history.add(H2HistoryEntry(rawH2, timestamp));
-        return rawH2;
-      }
-      
-      // 还在观察期内，继续收集数据
-      spikeState.spikeWindow.add(rawH2);
-      // 暂时使用之前的正常值，等待观察期结束
-      return spikeState.previousValue;
-    }
-    
-    // 7. 检测是否发生突变
-    // 突变定义为：值突然增大超过阈值（相对变化超过50%或绝对值变化超过2%LEL）
-    final absDiff = (rawH2 - lastValue).abs();
-    final relativeDiff = lastValue.abs() > 0.1 ? (absDiff / lastValue.abs()) : 0;
-    
-    // 突变阈值：绝对值变化超过2%LEL 或 相对变化超过50%
-    final isSpike = absDiff > 2.0 || (relativeDiff > 0.5 && absDiff > 1.0);
-    
-    if (isSpike && rawH2 > lastValue) {
-      // 检测到向上突变，检查是否超过固定范围
-      // 固定范围：10%LEL（具体数值范围）
-      final fixedRange = 10.0; // 固定范围：10%LEL
-      final spikeAbsValue = rawH2.abs();
-      final previousAbsValue = lastValue.abs();
-      
-      // 如果突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('氢气突变值超过固定范围: 节点=$nodeId, 突变值=$rawH2, 异常前值=$lastValue, 固定范围=$fixedRange, 使用异常前值');
-        // 不创建突变状态，直接使用异常前的值
-        history.add(H2HistoryEntry(lastValue, timestamp));
-        return lastValue;
-      }
-      
-      // 检测到向上突变，开始观察
-      print('氢气突变检测: 节点=$nodeId, 检测到突变: 从$lastValue到$rawH2 (变化: ${(relativeDiff * 100).toStringAsFixed(1)}%)');
-      
-      // 创建突变状态并开始观察
-      _h2SpikeStates[nodeId] = TempSpikeState(
-        spikeValue: rawH2,
-        spikeTimestamp: timestamp,
-        previousValue: lastValue,
-      );
-      
-      // 暂时使用之前的正常值，等待观察期结束再决定
-      return lastValue;
-    }
-    
-    // 8. 正常变化（非突变），直接使用当前值
-    history.add(H2HistoryEntry(rawH2, timestamp));
-    
-    // 限制历史记录长度（最多保留20个）
-    if (history.length > 20) {
-      history.removeAt(0);
-    }
-    
-    return rawH2;
-  }
-
-  // 烟雾值时间窗口过滤方法
-  // 使用时间窗口检测区分真实预警和传感器故障
-  int _filterSmokeValueWithTimeWindow(int nodeId, String channel, int rawSmoke, int timestamp) {
-    // 1. 基本范围检查：烟雾值超出合理范围（0-65535）认为无效
-    if (rawSmoke < 0 || rawSmoke > 65535) {
-      print('烟雾基本范围检查: 节点=$nodeId, 通道=$channel, 原始值=$rawSmoke超出范围[0, 65535]');
-      // 如果有历史值，返回最近的有效值
-      final historyKey = '${nodeId}_channel$channel';
-      final history = _smokeHistory[historyKey];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last.value;
-        print('烟雾使用历史值: 节点=$nodeId, 通道=$channel, 使用最近有效值=$lastValidValue');
-        return lastValidValue;
-      }
-      // 没有历史值，返回0
-      return 0;
-    }
-    
-    // 2. 获取历史记录
-    final historyKey = '${nodeId}_channel$channel';
-    final history = _smokeHistory.putIfAbsent(historyKey, () => <SmokeHistoryEntry>[]);
-    
-    // 3. 清理过期历史记录（只保留最近3秒的数据）
-    final expireTime = timestamp - 3000; // 3秒
-    history.removeWhere((entry) => entry.timestamp < expireTime);
-    
-    // 4. 如果没有历史数据，直接使用当前值并记录
-    if (history.isEmpty) {
-      history.add(SmokeHistoryEntry(rawSmoke, timestamp));
-      return rawSmoke;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastEntry = history.last;
-    final lastValue = lastEntry.value;
-    
-    // 6. 检查是否存在正在观察的突变状态
-    final spikeState = _smokeSpikeStates[historyKey];
-    
-    if (spikeState != null) {
-      // 正在观察一个突变状态
-      
-      // 检查突变值是否超过固定范围（具体数值范围）
-      // 固定范围：1000（具体数值范围）
-      final fixedRange = 1000.0; // 固定范围：1000
-      final spikeAbsValue = rawSmoke.abs();
-      final previousAbsValue = spikeState.previousValue.abs();
-      
-      // 如果当前突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('烟雾观察期内突变值超过固定范围: 节点=$nodeId, 通道=$channel, 当前值=$rawSmoke, 异常前值=${spikeState.previousValue}, 固定范围=$fixedRange, 使用异常前值');
-        // 清除突变状态
-        _smokeSpikeStates.remove(historyKey);
-        // 使用异常前的值
-        history.add(SmokeHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查是否是传感器故障（突变后很快恢复）
-      if (spikeState.isSensorFault(rawSmoke, timestamp)) {
-        print('烟雾传感器故障检测: 节点=$nodeId, 通道=$channel, 突变值=${spikeState.spikeValue}, 当前值=$rawSmoke, 已恢复到${spikeState.previousValue}附近，判定为传感器故障');
-        // 清除突变状态
-        _smokeSpikeStates.remove(historyKey);
-        // 使用之前的正常值
-        history.add(SmokeHistoryEntry(spikeState.previousValue, timestamp));
-        return spikeState.previousValue;
-      }
-      
-      // 检查突变是否稳定（在1-2秒内保持在一定范围内）
-      if (spikeState.isStableSpike(rawSmoke, timestamp)) {
-        print('烟雾稳定突变检测: 节点=$nodeId, 通道=$channel, 突变值=${spikeState.spikeValue}在观察期内保持稳定，判定为真实预警/故障');
-        // 清除突变状态，确认是真实的值
-        _smokeSpikeStates.remove(historyKey);
-        // 使用突变后的值（真实预警/故障）
-        history.add(SmokeHistoryEntry(rawSmoke, timestamp));
-        return rawSmoke;
-      }
-      
-      // 还在观察期内，继续收集数据
-      spikeState.spikeWindow.add(rawSmoke);
-      // 暂时使用之前的正常值，等待观察期结束
-      return spikeState.previousValue;
-    }
-    
-    // 7. 检测是否发生突变
-    // 突变定义为：值突然增大超过阈值（相对变化超过50%或绝对值变化超过500）
-    final absDiff = (rawSmoke - lastValue).abs();
-    final relativeDiff = lastValue > 0 ? (absDiff / lastValue) : 0;
-    
-    // 突变阈值：绝对值变化超过500 或 相对变化超过50%
-    final isSpike = absDiff > 500 || (relativeDiff > 0.5 && absDiff > 200);
-    
-    if (isSpike && rawSmoke > lastValue) {
-      // 检测到向上突变，检查是否超过固定范围
-      // 固定范围：1000（具体数值范围）
-      final fixedRange = 1000.0; // 固定范围：1000
-      final spikeAbsValue = rawSmoke.abs();
-      final previousAbsValue = lastValue.abs();
-      
-      // 如果突变值的绝对值超过异常值前的数值绝对值的固定范围，使用异常前的值
-      if (spikeAbsValue > previousAbsValue + fixedRange) {
-        print('烟雾突变值超过固定范围: 节点=$nodeId, 通道=$channel, 突变值=$rawSmoke, 异常前值=$lastValue, 固定范围=$fixedRange, 使用异常前值');
-        // 不创建突变状态，直接使用异常前的值
-        history.add(SmokeHistoryEntry(lastValue, timestamp));
-        return lastValue;
-      }
-      
-      // 检测到向上突变，开始观察
-      print('烟雾突变检测: 节点=$nodeId, 通道=$channel, 检测到突变: 从$lastValue到$rawSmoke (变化: ${(relativeDiff * 100).toStringAsFixed(1)}%)');
-      
-      // 创建突变状态并开始观察
-      _smokeSpikeStates[historyKey] = CoSpikeState(
-        spikeValue: rawSmoke,
-        spikeTimestamp: timestamp,
-        previousValue: lastValue,
-      );
-      
-      // 暂时使用之前的正常值，等待观察期结束再决定
-      return lastValue;
-    }
-    
-    // 8. 正常变化（非突变），直接使用当前值
-    history.add(SmokeHistoryEntry(rawSmoke, timestamp));
-    
-    // 限制历史记录长度（最多保留20个）
-    if (history.length > 20) {
-      history.removeAt(0);
-    }
-    
-    return rawSmoke;
+    return filtered;
   }
 
   // 湿度值时间窗口过滤方法
@@ -2318,386 +1652,11 @@ class SensorDataService {
     return rawHumidity;
   }
 
-  // 发送实时信息到远端服务器（03类型报文）（已废弃，不再主动发送）
-  void _sendRealtimeDataToServer(int nodeId) {
-    // 不再主动发送实时数据，等待客户端请求
-    print('实时数据已准备: 节点$nodeId (不再主动发送)');
-    return;
-    // if (!_modbusClient.isServerConnected) {
-    //   print('⚠️ Modbus TCP服务器未连接，跳过实时信息发送');
-    //   return;
-    // }
-    
-    // 获取节点最新快照
-    final snapshot = CsvLoggerService.instance.getNodeSnapshot(nodeId);
-    if (snapshot == null) {
-      print('⚠️ 节点$nodeId快照不存在，跳过实时信息发送');
-      return;
-    }
-    
-    final timestamp = DateTime.now().toIso8601String();
-    final sensorDataMap = snapshot.toMap();
-    
-    print('📤 发送实时信息（03类型）到远端服务器: 节点$nodeId');
-    print('📊 实时数据包含字段: ${sensorDataMap.keys.join(', ')}');
-    
-    // 不再主动发送实时数据，等待客户端请求
-    print('实时数据已准备: 节点$nodeId (不再主动发送)');
-    // _modbusClient.sendRealtimeData(
-    //   nodeId: nodeId,
-    //   sensorData: sensorDataMap,
-    //   timestamp: timestamp,
-    // );
-  }
-
-  // 发送处理后的数据（485格式）到远端服务器（已废弃，不再主动发送）
-  // 使用与节点详细页面相同的修正逻辑
+  // 解析完成后把快照丢给后台 isolate 编码上传，不占用轮询线程
   Future<void> _sendProcessedDataRS485(int nodeId) async {
-    // 不再主动发送数据，等待客户端请求
-    print('处理后数据已准备: 节点$nodeId (不再主动发送)');
-    return;
-    // 以下代码已废弃，不再主动发送数据，全部注释掉
-    /*
-    try {
-      if (!_modbusServer.isRunning) {
-        return;
-      }
-      
-      // 获取节点最新快照
-      final snapshot = CsvLoggerService.instance.getNodeSnapshot(nodeId);
-      if (snapshot == null) {
-        return;
-      }
-      
-      // 获取节点设置（修正值）
-      final settingsService = SettingsService();
-      final nodeSettings = await settingsService.getAllSettingsForNode(nodeId);
-      
-      // 手动实现自然对数（用于烟雾计算）
-      double _naturalLog(double x) {
-        if (x <= 0) return 0;
-        double result = 0.0;
-        double term = (x - 1) / (x + 1);
-        double termSquared = term * term;
-        for (int i = 0; i < 100; i++) {
-          result += term / (2 * i + 1);
-          term *= termSquared;
-        }
-        return 2 * result;
-      }
-      
-      // 计算烟雾浓度（与页面显示一致）
-      double _calculateSmokeConcentration(double xStar, double a, double T) {
-        final tSafe = (T == 0) ? 568.0 : T;
-        final delta = xStar - a;
-        if (delta <= 0) return 0.0;
-        final x0 = 568.0 * (delta / tSafe);
-        double m;
-        if (x0 < 568.0) {
-          m = -0.00000015 * x0 * x0 + 0.0007 * x0;
-        } else {
-          final lnX0 = _naturalLog(x0);
-          m = 0.2772 * lnX0 - 1.408;
-        }
-        return m < 0 ? 0 : m;
-      }
-      
-      // 获取修正值
-      final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
-      final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
-      final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
-      final humidityCorr = nodeSettings['humidityCorrection'] as double? ?? 0.0;
-      
-      // 计算上中下温度（与页面显示一致）
-      double upperTemp = (snapshot.temperature ?? 25) + upperCorr;
-      double middleTemp = (snapshot.temperature ?? 25) + middleCorr;
-      double lowerTemp = (snapshot.temperature ?? 25) + lowerCorr;
-      
-      // 计算防爆盒内环境参数
-      double correctedHumidity = (snapshot.humidity ?? 0) + humidityCorr;
-      correctedHumidity = correctedHumidity.clamp(0, 100);
-      final pressure = snapshot.pressureKpa ?? 0;
-      final h2Concentration = snapshot.h2Percentage ?? 0;
-      final rawCo = snapshot.coPpm?.toDouble() ?? 0;
-      final coConcentration = (rawCo < 0 || rawCo > 10000) ? 0 : rawCo;
-      double whiteSmoke = 0.1;
-      double blackSmoke = 0.1;
-      // smokeRatio 不在快照中，使用默认值0或从其他数据计算
-      final smokeRatio = 0; // 快照中没有此字段，使用默认值
-      final smokeExternalTemp = snapshot.smokeExternalTempC ?? 0;
-      
-      // 计算白烟和黑烟浓度
-      if (snapshot.smokeChannelA != null) {
-        final aA = (snapshot.smokeCalibA ?? 0).toDouble();
-        final tA = (snapshot.smokeThreshA ?? 568).toDouble();
-        whiteSmoke = _calculateSmokeConcentration(snapshot.smokeChannelA!.toDouble(), aA, tA);
-      }
-      if (snapshot.smokeChannelB != null) {
-        final aB = (snapshot.smokeCalibB ?? 0).toDouble();
-        final tB = (snapshot.smokeThreshB ?? 568).toDouble();
-        blackSmoke = _calculateSmokeConcentration(snapshot.smokeChannelB!.toDouble(), aB, tB);
-      }
-      
-      // ========== 第一部分：电缆接头测点温度（PT100数据） ==========
-      if (snapshot.pt100Temperatures != null) {
-        try {
-          final temps = jsonDecode(snapshot.pt100Temperatures!) as List;
-          if (temps.length < 9) {
-            print('PT100数据不足9个通道');
-            return;
-          }
-          
-          final pt100Corrections = nodeSettings['pt100Corrections'] as List<dynamic>? ?? List.filled(10, 0.0);
-          
-          // 应用误差修正：开路(-999)保持不变，否则加上修正值
-          final corrected = List<double>.generate(
-            temps.length,
-            (i) {
-              final base = temps[i] as double;
-              if (base == -999) return -999;
-              final delta = i < pt100Corrections.length ? (pt100Corrections[i] as double? ?? 0.0) : 0.0;
-              return base + delta;
-            },
-          );
-          
-          // 更新上中下温度（如果有PT100数据）
-          // 上温度：节点1使用通道10，其他节点使用通道9
-          if (nodeId == 1 && corrected.length >= 11) {
-            upperTemp = corrected[10] + upperCorr;
-          } else if (corrected.length >= 10) {
-            upperTemp = corrected[9] + upperCorr;
-          }
-          
-          // 中温度：通道11
-          if (corrected.length >= 12 && corrected[11] != -999) {
-            middleTemp = corrected[11] + middleCorr;
-          }
-          
-          // A相：ch0,ch1,ch2 -> 左外,中外,右外
-          final aL = corrected[0];
-          final aM = corrected[1];
-          final aR = corrected[2];
-          
-          // B相：ch3,ch4,ch5 -> 左外,中外,右外
-          final bL = corrected[3];
-          final bM = corrected[4];
-          final bR = corrected[5];
-          
-          // C相：ch6,ch7,ch8 -> 左外,中外,右外
-          final cL = corrected[6];
-          final cM = corrected[7];
-          final cR = corrected[8];
-          
-          // 计算三相平均值（sensor_flutter5使用中外温度平均值作为xia）
-          final middleAvg = (aM + bM + cM) / 3; // 中外温度平均值
-          
-          // 获取k1、k2参数
-          final aK1 = nodeSettings['aK1'] as double? ?? 6.42;
-          final aK2 = nodeSettings['aK2'] as double? ?? 2.5;
-          final bK1 = nodeSettings['bK1'] as double? ?? 6.42;
-          final bK2 = nodeSettings['bK2'] as double? ?? 2.5;
-          final cK1 = nodeSettings['cK1'] as double? ?? 6.42;
-          final cK2 = nodeSettings['cK2'] as double? ?? 2.5;
-          
-          // 计算内温度：Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)
-          double _calculateInnerTemp(double xi, double x0i, double xia, double k1, double k2) {
-            if (xi == -999) return -999;
-            if (xi < x0i) return xi;
-            final deltaEnv = (xi - x0i) < 0 ? 0 : (xi - x0i);
-            final deltaPhaseAvg = (xi - xia) < 0 ? 0 : (xi - xia);
-            return xi + k1 * deltaEnv + k2 * deltaPhaseAvg;
-          }
-          
-          // A相内温度（环境温度为上温度，使用中外温度平均值）
-          final aLInner = _calculateInnerTemp(aL, upperTemp, middleAvg, aK1, aK2);
-          final aMInner = _calculateInnerTemp(aM, upperTemp, middleAvg, aK1, aK2);
-          final aRInner = _calculateInnerTemp(aR, upperTemp, middleAvg, aK1, aK2);
-          
-          // B相内温度（环境温度为中温度，使用中外温度平均值）
-          final bLInner = _calculateInnerTemp(bL, middleTemp, middleAvg, bK1, bK2);
-          final bMInner = _calculateInnerTemp(bM, middleTemp, middleAvg, bK1, bK2);
-          final bRInner = _calculateInnerTemp(bR, middleTemp, middleAvg, bK1, bK2);
-          
-          // C相内温度（环境温度为下温度，使用中外温度平均值）
-          final cLInner = _calculateInnerTemp(cL, lowerTemp, middleAvg, cK1, cK2);
-          final cMInner = _calculateInnerTemp(cM, lowerTemp, middleAvg, cK1, cK2);
-          final cRInner = _calculateInnerTemp(cR, lowerTemp, middleAvg, cK1, cK2);
-          
-          // 按照页面显示顺序发送：A相6个值 + B相6个值 + C相6个值 = 18个值（36字节）
-          // A相：[左外, 左内, 中外, 中内, 右外, 右内]
-          // B相：[左外, 左内, 中外, 中内, 右外, 右内]
-          // C相：[左外, 左内, 中外, 中内, 右外, 右内]
-          final phaseTemps = [
-            aL, aLInner, aM, aMInner, aR, aRInner,  // A相
-            bL, bLInner, bM, bMInner, bR, bRInner,  // B相
-            cL, cLInner, cM, cMInner, cR, cRInner,  // C相
-          ];
-          
-          final data = <int>[];
-          for (final temp in phaseTemps) {
-            int raw;
-            if (temp == -999.0) {
-              raw = 0x8066; // 开路标记
-            } else {
-              final signedRaw = (temp / 0.01).round();
-              raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-            }
-            data.add((raw >> 8) & 0xFF);
-            data.add(raw & 0xFF);
-          }
-          
-          // 不再主动发送数据，等待客户端请求
-          print('电缆接头测点温度数据已准备: 节点$nodeId (不再主动发送)');
-          // _modbusClient.sendRS485Frame(
-          //   nodeId: nodeId,
-          //   sensorId: RS485Protocol.SENSOR_CABLE_TEMP,
-          //   data: data,
-          // );
-        } catch (e) {
-          print('PT100数据解析失败: $e');
-        }
-      }
-      
-      // ========== 第二部分：防爆盒内环境参数 ==========
-      // 包含：上温度、中温度、下温度、湿度、压力、白烟、黑烟、H2、CO、烟雾比值、外部温度
-      final envData = <int>[];
-      
-      // 上温度（2字节，高字节在前，乘以100）
-      final upperTempRaw = (upperTemp * 100).round();
-      envData.add((upperTempRaw >> 8) & 0xFF);
-      envData.add(upperTempRaw & 0xFF);
-      
-      // 中温度（2字节，高字节在前，乘以100）
-      final middleTempRaw = (middleTemp * 100).round();
-      envData.add((middleTempRaw >> 8) & 0xFF);
-      envData.add(middleTempRaw & 0xFF);
-      
-      // 下温度（2字节，高字节在前，乘以100）
-      final lowerTempRaw = (lowerTemp * 100).round();
-      envData.add((lowerTempRaw >> 8) & 0xFF);
-      envData.add(lowerTempRaw & 0xFF);
-      
-      // 湿度（2字节，高字节在前，乘以100）
-      final humidityRaw = (correctedHumidity * 100).round();
-      envData.add((humidityRaw >> 8) & 0xFF);
-      envData.add(humidityRaw & 0xFF);
-      
-      // 压力（2字节，高字节在前，乘以100）
-      final pressureRaw = (pressure * 100).round();
-      envData.add((pressureRaw >> 8) & 0xFF);
-      envData.add(pressureRaw & 0xFF);
-      
-      // 白烟浓度（2字节，高字节在前，乘以1000）
-      final whiteSmokeRaw = (whiteSmoke * 1000).round().clamp(0, 65535);
-      envData.add((whiteSmokeRaw >> 8) & 0xFF);
-      envData.add(whiteSmokeRaw & 0xFF);
-      
-      // 黑烟浓度（2字节，高字节在前，乘以1000）
-      final blackSmokeRaw = (blackSmoke * 1000).round().clamp(0, 65535);
-      envData.add((blackSmokeRaw >> 8) & 0xFF);
-      envData.add(blackSmokeRaw & 0xFF);
-      
-      // H2浓度（1字节，百分比值）
-      envData.add(h2Concentration.round().clamp(0, 255));
-      
-      // CO浓度（2字节，高字节在前，ppm值）
-      final coRaw = coConcentration.round();
-      envData.add((coRaw >> 8) & 0xFF);
-      envData.add(coRaw & 0xFF);
-      
-      // 烟雾比值（1字节）- 使用上面声明的smokeRatio变量（已在1529行声明）
-      envData.add(smokeRatio.round().clamp(0, 255));
-      
-      // 外部温度（2字节，低字节在前，乘以100）
-      final extTempRaw = (smokeExternalTemp * 100).round().clamp(-32768, 32767);
-      final signedExtTempRaw = extTempRaw < 0 ? (extTempRaw + 65536) : extTempRaw;
-      envData.add(signedExtTempRaw & 0xFF);
-      envData.add((signedExtTempRaw >> 8) & 0xFF);
-      
-      // 不再主动发送数据，等待客户端请求
-      print('防爆盒内环境参数数据已准备: 节点$nodeId (不再主动发送)');
-      // _modbusClient.sendRS485Frame(
-      //   nodeId: nodeId,
-      //   sensorId: RS485Protocol.SENSOR_ENV_PARAMS,
-      //   data: envData,
-      // );
-      
-    } catch (e) {
-      print('发送处理后数据失败: $e');
-    }
-    */
-  }
-
-  // 检查故障信息
-  void _checkFaultInfo(SensorData data) {
-    final faults = <String>[];
-    final faultData = <String, dynamic>{};
-
-    // print('检查节点${data.nodeId}的故障信息...');
-
-    // 检查烟雾传感器故障
-    if (data.smokeStatus != null && (data.smokeStatus! & 0x04) != 0) {
-      final key = '${data.nodeId}|smoke_fault';
-      if (_shouldHoldTrigger(key, true, 5000)) {
-        faults.add('烟雾传感器故障');
-      }
-      faultData['smoke_status'] = data.smokeStatus;
-      faultData['smoke_channel_a'] = data.smokeChannelA;
-      faultData['smoke_channel_b'] = data.smokeChannelB;
-      print('检测到烟雾传感器故障: status=${data.smokeStatus}');
-    }
-
-    // 检查CO传感器异常值
-    if (data.coPpm != null && (data.coPpm! < 0 || data.coPpm! > 10000)) {
-      final key = '${data.nodeId}|co_abnormal';
-      if (_shouldHoldTrigger(key, true, 5000)) {
-        faults.add('CO传感器异常');
-      }
-      faultData['co_ppm'] = data.coPpm;
-      print('检测到CO传感器异常: coPpm=${data.coPpm}');
-    }
-
-    // 检查PT100开路
-    if (data.pt100Temperatures != null) {
-      try {
-        final temps = jsonDecode(data.pt100Temperatures!) as List;
-        final openCircuits = temps.where((temp) => temp == -999.0).length;
-        if (openCircuits > 0) {
-          final key = '${data.nodeId}|pt100_open';
-          if (_shouldHoldTrigger(key, true, 5000)) {
-            faults.add('PT100传感器开路($openCircuits个通道)');
-          }
-          faultData['pt100_open_circuits'] = openCircuits;
-          faultData['pt100_temperatures'] = temps;
-          print('检测到PT100传感器开路: $openCircuits个通道');
-        }
-      } catch (e) {
-        print('解析PT100温度数据失败: $e');
-      }
-    }
-
-    // 移除测试故障检测，只检测真实故障
-
-    // 如果有故障，发送通知
-    if (faults.isNotEmpty) {
-      final faultType = faults.join(', ');
-      final faultDescription = '节点${data.nodeId}检测到故障: $faultType';
-      final timestamp = DateTime.now().toIso8601String();
-
-      print('故障信息已记录: $faultDescription (不再主动发送，等待客户端请求)');
-      // 不再主动发送故障信息，等待客户端请求
-      // _modbusClient.sendFaultInfo(
-      //   nodeId: data.nodeId,
-      //   faultType: faultType,
-      //   faultDescription: faultDescription,
-      //   timestamp: timestamp,
-      //   faultData: faultData,
-      // );
-
-      // print('节点${data.nodeId}故障检测: $faultDescription');
-    } else {
-      // print('节点${data.nodeId}无故障');
-    }
+    final snapshot = CsvLoggerService.instance.getNodeSnapshot(nodeId);
+    if (snapshot == null) return;
+    BackgroundCpuService.instance.submitUpload(snapshot.toMap());
   }
 
 }
@@ -2713,3 +1672,4 @@ class SensorTypes {
   static const int PT100_SENSOR = 0x07;
   static const int STATUS_OVERVIEW = 0x0C;
 }
+

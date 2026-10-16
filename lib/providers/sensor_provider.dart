@@ -8,7 +8,7 @@ class SensorProvider with ChangeNotifier {
   final SensorDataService _sensorService = SensorDataService();
   
   List<NodeData> _nodes = [];
-  // 最多5个节点
+  // 最多2个节点
   bool _isConnected = false;
   bool _isClientConnected = false;
   String _connectionStatus = '未连接';
@@ -272,22 +272,6 @@ class SensorProvider with ChangeNotifier {
 
   // 获取网络连接状态
   bool get isNetworkConnected => _sensorService.isNetworkConnected();
-
-  // 获取Modbus TCP服务器连接状态
-  bool get isModbusServerConnected => _sensorService.isModbusServerConnected();
-
-  // 获取节点连接状态（基于查询判断逻辑）
-  bool isNodeConnected(int nodeId) {
-    return _sensorService.isNodeConnected(nodeId);
-  }
-
-  // 检测Modbus TCP服务器连接
-  Future<bool> checkModbusServerConnection() async {
-    return await _sensorService.checkModbusServerConnection();
-  }
-
-  // 获取Modbus TCP服务器信息
-  String get modbusServerInfo => _sensorService.getModbusServerInfo();
 
   // 清理资源
   void dispose() {

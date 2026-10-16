@@ -8,7 +8,6 @@ import '../services/alert_service.dart';
 import '../services/settings_service.dart';
 import '../services/password_service.dart';
 import '../services/ignore_service.dart';
-import '../services/sensor_data_service.dart';
 
 class DataDetailPage extends StatefulWidget {
   final int nodeId;
@@ -112,15 +111,12 @@ class _DataDetailPageState extends State<DataDetailPage> {
     print('PT100 temperatures: ${currentNode.pt100Temperatures}');
     print('NodeData完整信息: smokeChannelA=${currentNode.smokeChannelA}, smokeChannelB=${currentNode.smokeChannelB}, smokeExternalTempC=${currentNode.smokeExternalTempC}');
     
-    // 设置温度数据（叠加参数修正）
+    // 设置温度数据（叠加参数修正）- 在setState外部获取设置
     final s = SettingsService();
     final nodeSettings = await s.getAllSettingsForNode(widget.nodeId);
     final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
     final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
     final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
-    
-    // 获取节点特定的PT100修正值
-    final pt100Corrections = nodeSettings['pt100Corrections'] as List<dynamic>? ?? List.filled(10, 0.0);
     
     setState(() {
       final humidityCorr = (nodeSettings['humidityCorrection'] as double? ?? 0.0);
@@ -140,30 +136,10 @@ class _DataDetailPageState extends State<DataDetailPage> {
       }
       smokeRatio = currentNode.smokeRatio ?? 0;
       
-      // 获取 SensorDataService 实例以访问历史值
-      final sensorService = SensorDataService();
-      
-      // 辅助函数：获取温度值，如果异常则使用历史正常值
-      double getValidTempForEnv(int channelIndex, double currentValue, double defaultTemp) {
-        // 检查是否异常（超出合理范围）
-        if (currentValue < -50 || currentValue > 200 || currentValue == -999) {
-          // 尝试获取历史正常值
-          final historyValue = sensorService.getTempHistoryValue(widget.nodeId, channelIndex, currentValue);
-          if (historyValue != null) {
-            print('环境温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用历史值=$historyValue');
-            return historyValue;
-          }
-          // 没有历史值，使用默认温度
-          return defaultTemp;
-        }
-        return currentValue;
-      }
-      
       // 使用PT100通道11作为中温度，温湿度传感器温度作为下温度
       if (currentNode.pt100Temperatures != null && currentNode.pt100Temperatures!.length >= 12) {
         final pt11Temp = currentNode.pt100Temperatures![11];
-        final validPt11Temp = getValidTempForEnv(11, pt11Temp, (currentNode.temperature ?? 25).toDouble());
-        middleTemp = (validPt11Temp != -999) ? validPt11Temp + middleCorr : (currentNode.temperature ?? 25) + middleCorr;
+        middleTemp = (pt11Temp != -999) ? pt11Temp + middleCorr : (currentNode.temperature ?? 25) + middleCorr;
       } else {
         middleTemp = (currentNode.temperature ?? 25) + middleCorr; // 备用：温湿度传感器温度
       }
@@ -201,6 +177,8 @@ class _DataDetailPageState extends State<DataDetailPage> {
       if (currentNode.pt100Temperatures != null && currentNode.pt100Temperatures!.length >= 9) {
         final temps = currentNode.pt100Temperatures!;
         
+        // 获取节点特定的PT100修正值
+        final pt100Corrections = nodeSettings['pt100Corrections'] as List<dynamic>? ?? List.filled(10, 0.0);
         
         // 应用误差修正：开路(-999)保持不变，否则加上修正值
         final corrected = List<double>.generate(
@@ -215,59 +193,28 @@ class _DataDetailPageState extends State<DataDetailPage> {
         print('Processing PT100 data: $temps');
         print('PT100 corrections: $_pt100Corrections');
         print('PT100 corrected: $corrected');
+        // A: ch1,ch2,ch3
+        final aL = corrected[0];
+        final aM = corrected[1];
+        final aR = corrected[2];
         
-        // 获取 SensorDataService 实例以访问历史值
-        final sensorService = SensorDataService();
+        // B: ch4,ch5,ch6
+        final bL = corrected[3];
+        final bM = corrected[4];
+        final bR = corrected[5];
         
-        // 辅助函数：获取温度值，如果异常则使用历史正常值
-        double getValidTemp(int channelIndex, double currentValue) {
-          // 检查是否异常（超出合理范围）
-          if (currentValue < -50 || currentValue > 200 || currentValue == -999) {
-            // 尝试获取历史正常值
-            final historyValue = sensorService.getTempHistoryValue(widget.nodeId, channelIndex, currentValue);
-            if (historyValue != null) {
-              print('温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用历史值=$historyValue');
-              return historyValue;
-            }
-            // 没有历史值，使用默认值25°C（但保持开路标记）
-            if (currentValue == -999) return -999;
-            print('温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用默认值25.0');
-            return 25.0;
-          }
-          return currentValue;
-        }
-        
-        // A: ch1,ch2,ch3 - 使用有效温度值（异常时使用历史值）
-        final aL = getValidTemp(0, corrected[0]);
-        final aM = getValidTemp(1, corrected[1]);
-        final aR = getValidTemp(2, corrected[2]);
-        
-        // B: ch4,ch5,ch6 - 使用有效温度值（异常时使用历史值）
-        final bL = getValidTemp(3, corrected[3]);
-        final bM = getValidTemp(4, corrected[4]);
-        final bR = getValidTemp(5, corrected[5]);
-        
-        // C: ch7,ch8,ch9 - 使用有效温度值（异常时使用历史值）
-        final cL = getValidTemp(6, corrected[6]);
-        final cM = getValidTemp(7, corrected[7]);
-        final cR = getValidTemp(8, corrected[8]);
+        // C: ch7,ch8,ch9
+        final cL = corrected[6];
+        final cM = corrected[7];
+        final cR = corrected[8];
         
         // 计算内温度：Y = xi + 6.42（xi – x0i）+（xi-xia）*2.5
         // xi: 外测点温度, x0i: 环境温度, xia: 三相平均值
         
-        // 计算三相平均值（使用有效温度值，排除开路值）
-        double calculateAvg(double val1, double val2, double val3) {
-          int count = 0;
-          double sum = 0;
-          if (val1 != -999) { sum += val1; count++; }
-          if (val2 != -999) { sum += val2; count++; }
-          if (val3 != -999) { sum += val3; count++; }
-          return count > 0 ? sum / count : 25.0; // 如果都是开路，使用默认值
-        }
-        
-        final leftAvg = calculateAvg(aL, bL, cL);   // 左外温度平均值
-        final middleAvg = calculateAvg(aM, bM, cM); // 中外温度平均值  
-        final rightAvg = calculateAvg(aR, bR, cR);  // 右外温度平均值
+        // 计算三相平均值
+        final leftAvg = (aL + bL + cL) / 3;   // 左外温度平均值
+        final middleAvg = (aM + bM + cM) / 3; // 中外温度平均值  
+        final rightAvg = (aR + bR + cR) / 3;  // 右外温度平均值
         
         // 获取节点特定的k1、k2参数
         final aK1 = nodeSettings['aK1'] as double? ?? 6.42;
@@ -277,35 +224,30 @@ class _DataDetailPageState extends State<DataDetailPage> {
         final cK1 = nodeSettings['cK1'] as double? ?? 6.42;
         final cK2 = nodeSettings['cK2'] as double? ?? 2.5;
         
-        // A相内温度计算（环境温度为上温度，使用3测点中外温度平均值）
-        final aLInner = _calculateInnerTempWithParams(aL, upperTemp, middleAvg, aK1, aK2);
+        // A相内温度计算（环境温度为上温度）
+        final aLInner = _calculateInnerTempWithParams(aL, upperTemp, leftAvg, aK1, aK2);
         final aMInner = _calculateInnerTempWithParams(aM, upperTemp, middleAvg, aK1, aK2);
-        final aRInner = _calculateInnerTempWithParams(aR, upperTemp, middleAvg, aK1, aK2);
+        final aRInner = _calculateInnerTempWithParams(aR, upperTemp, rightAvg, aK1, aK2);
         
-        // B相内温度计算（环境温度为中温度，使用3测点中外温度平均值）
-        final bLInner = _calculateInnerTempWithParams(bL, middleTemp, middleAvg, bK1, bK2);
+        // B相内温度计算（环境温度为中温度）
+        final bLInner = _calculateInnerTempWithParams(bL, middleTemp, leftAvg, bK1, bK2);
         final bMInner = _calculateInnerTempWithParams(bM, middleTemp, middleAvg, bK1, bK2);
-        final bRInner = _calculateInnerTempWithParams(bR, middleTemp, middleAvg, bK1, bK2);
+        final bRInner = _calculateInnerTempWithParams(bR, middleTemp, rightAvg, bK1, bK2);
         
-        // C相内温度计算（环境温度为下温度，使用3测点中外温度平均值）
-        final cLInner = _calculateInnerTempWithParams(cL, lowerTemp, middleAvg, cK1, cK2);
+        // C相内温度计算（环境温度为下温度）
+        final cLInner = _calculateInnerTempWithParams(cL, lowerTemp, leftAvg, cK1, cK2);
         final cMInner = _calculateInnerTempWithParams(cM, lowerTemp, middleAvg, cK1, cK2);
-        final cRInner = _calculateInnerTempWithParams(cR, lowerTemp, middleAvg, cK1, cK2);
+        final cRInner = _calculateInnerTempWithParams(cR, lowerTemp, rightAvg, cK1, cK2);
         
         // 设置温度数组：[左外, 左内, 中外, 中内, 右外, 右内]
         phaseATemps = [aL, aLInner, aM, aMInner, aR, aRInner];
         phaseBTemps = [bL, bLInner, bM, bMInner, bR, bRInner];
         phaseCTemps = [cL, cLInner, cM, cMInner, cR, cRInner];
-        // 上温度（叠加修正）：节点1使用通道10，其他节点使用通道9
-        // 使用有效温度值（异常时使用历史值）
-        if (widget.nodeId == 1) {
-          // 节点1使用通道10
-          final validUpperTemp = getValidTemp(10, corrected[10]);
-          upperTemp = (validUpperTemp != -999) ? validUpperTemp + upperCorr : 25 + upperCorr;
+        // 第10通道为上温度（叠加修正）
+        if (currentNode.pt100Temperatures!.length >= 10) {
+          upperTemp = corrected[9] + upperCorr;
         } else {
-          // 其他节点使用通道9
-          final validUpperTemp = getValidTemp(9, corrected[9]);
-          upperTemp = (validUpperTemp != -999) ? validUpperTemp + upperCorr : 25 + upperCorr;
+          upperTemp = 25 + upperCorr; // 默认值
         }
 
         print('Phase A temps: $phaseATemps');
@@ -315,7 +257,7 @@ class _DataDetailPageState extends State<DataDetailPage> {
         // 如果没有PT100数据，设置默认值
         upperTemp = 25 + upperCorr;
         middleTemp = (currentNode.temperature ?? 25) + middleCorr;
-        lowerTemp = (currentNode.temperature ?? 25) + lowerCorr; // 统一使用温湿度传感器温度
+        lowerTemp = (currentNode.pressureTempC ?? 25) + lowerCorr;
         
         // 设置测试数据显示
         phaseADisplay = ['26.1 °C', '26.3 °C', '24.9 °C'];
@@ -398,6 +340,11 @@ class _DataDetailPageState extends State<DataDetailPage> {
     // 如果外测点温度为开路，内温度也为开路
     if (xi == -999) return -999;
     
+    // 当外温度小于环境温度时，中内温度等于中外温度
+    if (xi < x0i) {
+      return xi;
+    }
+    
     // 获取对应相的k1、k2参数
     final settings = SettingsService();
     double k1, k2;
@@ -429,16 +376,11 @@ class _DataDetailPageState extends State<DataDetailPage> {
     final y = xi + k1 * nonNegativeEnv + k2 * nonNegativePhaseAvg;
     return y;
   }
-
+  
   // 计算内温度（使用指定参数）
   double _calculateInnerTempWithParams(double xi, double x0i, double xia, double k1, double k2) {
     // 如果外测点温度为开路，内温度也为开路
     if (xi == -999) return -999;
-    
-    // 输入参数验证（仅记录，不限制）
-    if (xi < -50 || xi > 200 || x0i < -50 || x0i > 200 || xia < -50 || xia > 200) {
-      print('⚠️ 中内温度计算输入参数异常: xi=$xi, x0i=$x0i, xia=$xia');
-    }
     
     // 当外温度小于环境温度时，中内温度等于中外温度
     if (xi < x0i) {
@@ -453,19 +395,6 @@ class _DataDetailPageState extends State<DataDetailPage> {
     
     // 应用公式：Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)
     final y = xi + k1 * nonNegativeEnv + k2 * nonNegativePhaseAvg;
-    
-    // 异常高温检测和调试输出
-    if (y > 200 || y < -50) {
-      print('🚨 中内温度计算结果异常: $y°C');
-      print('   计算公式: Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)');
-      print('   输入参数: xi=$xi, x0i=$x0i, xia=$xia');
-      print('   计算参数: k1=$k1, k2=$k2');
-      print('   差值计算: deltaEnv=${deltaEnv.toStringAsFixed(6)}, deltaPhaseAvg=${deltaPhaseAvg.toStringAsFixed(6)}');
-      print('   非负值: nonNegativeEnv=${nonNegativeEnv.toStringAsFixed(6)}, nonNegativePhaseAvg=${nonNegativePhaseAvg.toStringAsFixed(6)}');
-      print('   分步计算: xi=$xi + k1×${nonNegativeEnv.toStringAsFixed(6)} + k2×${nonNegativePhaseAvg.toStringAsFixed(6)}');
-      print('   分步结果: $xi + ${(k1 * nonNegativeEnv).toStringAsFixed(6)} + ${(k2 * nonNegativePhaseAvg).toStringAsFixed(6)} = $y');
-    }
-    
     return y;
   }
 
@@ -551,13 +480,21 @@ class _DataDetailPageState extends State<DataDetailPage> {
     });
   }
 
-  // 判断节点是否连接（基于查询判断逻辑）
+  // 判断节点是否连接
   bool _isConnected(NodeData? node) {
     if (node == null) return false;
     
-    // 使用基于查询判断的连接状态（统一判断逻辑）
-    final sensorProvider = Provider.of<SensorProvider>(context, listen: false);
-    return sensorProvider.isNodeConnected(node.nodeId);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final isStale = (node.lastUpdateTimestamp == null) || (now - node.lastUpdateTimestamp! > 40000);
+    
+    if (isStale) return false;
+    
+    // 基于实际传感器数据判断连接状态
+    final hasData = node.temperature != null || node.humidity != null || node.coPpm != null || 
+        node.h2Percentage != null || node.pressureKpa != null || node.smokeChannelA != null || 
+        node.smokeChannelB != null || (node.pt100Temperatures != null && node.pt100Temperatures!.isNotEmpty);
+    
+    return hasData;
   }
 
   @override

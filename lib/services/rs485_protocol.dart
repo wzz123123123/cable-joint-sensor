@@ -101,6 +101,22 @@ class RS485Protocol {
     final intValue = (value * 100).round();
     return intTo2Bytes(intValue);
   }
+
+  /// 温度编码：开路 -999 → 0x8066；负数按无符号 16 位。
+  static List<int> encodeTemp100(double value) {
+    if (value == -999) return [0x80, 0x66];
+    var v = (value * 100).round();
+    if (v < 0) v += 65536;
+    return intTo2Bytes(v & 0xFFFF);
+  }
+
+  /// 烟雾浓度编码：乘以 1000，高字节在前。
+  static List<int> encodeSmoke1000(double value) {
+    var v = (value * 1000).round();
+    if (v < 0) v = 0;
+    if (v > 65535) v = 65535;
+    return intTo2Bytes(v);
+  }
   
   /// 将浮点数转换为4字节整数（乘以100，高字节在前）
   static List<int> floatTo4Bytes(double value) {

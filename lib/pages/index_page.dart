@@ -6,6 +6,8 @@ import '../models/node_data.dart';
 import '../services/alert_service.dart';
 import '../services/password_service.dart';
 import '../services/settings_service.dart';
+import '../services/serial_debug_logger.dart';
+import '../services/csv_logger_service.dart';
 import 'data_detail_page.dart';
 import 'daily_history_page.dart';
 
@@ -29,15 +31,23 @@ class _IndexPageState extends State<IndexPage> {
   }
 
   // 根据系统状态计算卡片背景色
-  Future<Color> _computeCardColor(NodeData? node, SensorProvider sensorProvider) async {
+  Future<Color> _computeCardColor(NodeData? node) async {
     if (node == null) return const Color(0xFFBDBDBD); // 灰色表示未连接
     
-    // 使用基于查询判断的连接状态（统一判断逻辑）
-    final isConnected = sensorProvider.isNodeConnected(node.nodeId);
+    // 检查连接状态
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final isStale = node.lastUpdateTimestamp == null || (now - node.lastUpdateTimestamp! > 40000);
     
-    if (!isConnected) return const Color(0xFFBDBDBD); // 灰色表示未连接
+    if (isStale) return const Color(0xFFBDBDBD); // 灰色表示未连接
     
-    // 已连接时根据系统状态显示颜色
+    // 检查是否有数据
+    final hasData = node.temperature != null || node.humidity != null || node.coPpm != null || 
+        node.h2Percentage != null || node.pressureKpa != null || node.smokeChannelA != null || 
+        node.smokeChannelB != null || (node.pt100Temperatures != null && node.pt100Temperatures!.isNotEmpty);
+    
+    if (!hasData) return const Color(0xFFBDBDBD); // 灰色表示未连接
+    
+    // 有数据时根据系统状态显示颜色
     try {
       final hex = await node.getSystemStatusColor(); // e.g. '#00C853'
       final value = int.parse(hex.substring(1), radix: 16) + 0xFF000000;
@@ -48,15 +58,23 @@ class _IndexPageState extends State<IndexPage> {
   }
 
   // 获取显示状态：未连接时显示未连接，否则显示系统状态
-  Future<String> _getDisplayStatus(NodeData? node, SensorProvider sensorProvider) async {
+  Future<String> _getDisplayStatus(NodeData? node) async {
     if (node == null) return '未连接';
     
-    // 使用基于查询判断的连接状态（统一判断逻辑）
-    final isConnected = sensorProvider.isNodeConnected(node.nodeId);
+    // 检查连接状态
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final isStale = node.lastUpdateTimestamp == null || (now - node.lastUpdateTimestamp! > 40000);
     
-    if (!isConnected) return '未连接';
+    if (isStale) return '未连接';
     
-    // 已连接时显示系统状态
+    // 检查是否有数据
+    final hasData = node.temperature != null || node.humidity != null || node.coPpm != null || 
+        node.h2Percentage != null || node.pressureKpa != null || node.smokeChannelA != null || 
+        node.smokeChannelB != null || (node.pt100Temperatures != null && node.pt100Temperatures!.isNotEmpty);
+    
+    if (!hasData) return '未连接';
+    
+    // 有数据时显示系统状态
     return await node.getSystemStatusText();
   }
 
@@ -159,15 +177,8 @@ class _IndexPageState extends State<IndexPage> {
     double middleTemp = (node.temperature ?? 25.0) + middleCorr;
     double lowerTemp = (node.temperature ?? 25.0) + lowerCorr;
     
-    // 如果有PT100数据，使用PT100通道作为上温度：节点1使用通道10，其他节点使用通道9
-    if (node.nodeId == 1) {
-      // 节点1使用通道10
-      final pt10Temp = corrected[10];
-      if (pt10Temp != -999) {
-        upperTemp = pt10Temp + upperCorr;
-      }
-    } else {
-      // 其他节点使用通道9
+    // 如果有PT100数据，使用PT100通道9作为上温度
+    if (t.length >= 10) {
       final pt9Temp = corrected[9];
       if (pt9Temp != -999) {
         upperTemp = pt9Temp + upperCorr;
@@ -237,10 +248,10 @@ class _IndexPageState extends State<IndexPage> {
   }
 
   // 湿度展示（三倍字号）
-  Future<Widget> _buildHumidityRow(NodeData? node, SensorProvider sensorProvider) async {
+  Future<Widget> _buildHumidityRow(NodeData? node) async {
     final String humidityText = '湿度: ${node?.humidity == null ? '--' : node!.humidity!.toStringAsFixed(1)}%RH';
     final Color sysColor = node != null ? Color(int.parse((await node.getSystemStatusColor()).substring(1), radix: 16) + 0xFF000000) : const Color(0xFFBDBDBD);
-    final String displayStatus = await _getDisplayStatus(node, sensorProvider);
+    final String displayStatus = await _getDisplayStatus(node);
     return Row(
       children: [
         // 与A/B/C中内三列对齐：每列一个Expanded
@@ -375,6 +386,16 @@ class _IndexPageState extends State<IndexPage> {
                       ],
                     ),
                   ),
+
+                  Container(
+                    width: double.infinity,
+                    color: const Color(0xFF5D4037),
+                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                    child: SelectableText(
+                      '版本1.0.22 固定/dev/ttyS7    串口: ${sensorProvider.connectionStatus}    数据记录: ${CsvLoggerService.instance.displayPath ?? "初始化中"}    调试日志: ${SerialDebugLogger.instance.displayPath ?? "初始化中"}',
+                      style: const TextStyle(fontSize: 18, color: Colors.white),
+                    ),
+                  ),
                   
                   // 节点卡片容器
                   Expanded(
@@ -387,7 +408,6 @@ class _IndexPageState extends State<IndexPage> {
                           return Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              // 第一行：2个卡片
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
@@ -397,7 +417,6 @@ class _IndexPageState extends State<IndexPage> {
                                 ],
                               ),
                               const SizedBox(height: 48),
-                              // 第二行：2个卡片
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
@@ -407,7 +426,6 @@ class _IndexPageState extends State<IndexPage> {
                                 ],
                               ),
                               const SizedBox(height: 48),
-                              // 第三行：2个卡片（节点5+按钮容器）
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
@@ -548,7 +566,7 @@ class _IndexPageState extends State<IndexPage> {
 
   Widget _buildSensorStatus(String name, int status, int? lastUpdateTimestamp) {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp) > 10000;
+    final isStale = lastUpdateTimestamp == null || (now - lastUpdateTimestamp) > 40000;
     final color = isStale ? const Color(0xFFD50000)
         : (status > 0 ? const Color(0xFF00C853) : const Color(0xFFD50000));
     return Container(
@@ -583,7 +601,7 @@ class _IndexPageState extends State<IndexPage> {
         content: TextField(
           controller: controller,
           decoration: const InputDecoration(
-            hintText: '输入节点ID (0-15)',
+            hintText: '输入节点ID (1-5)',
             border: OutlineInputBorder(),
           ),
           keyboardType: TextInputType.number,
@@ -596,7 +614,7 @@ class _IndexPageState extends State<IndexPage> {
           TextButton(
             onPressed: () {
               final nodeId = int.tryParse(controller.text);
-              if (nodeId != null && nodeId >= 0 && nodeId <= 15) {
+              if (nodeId != null && nodeId >= 1 && nodeId <= 5) {
                 sensorProvider.addNode(nodeId);
                 Navigator.pop(context);
                 ScaffoldMessenger.of(context).showSnackBar(
@@ -604,7 +622,7 @@ class _IndexPageState extends State<IndexPage> {
                 );
               } else {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('请输入有效的节点ID (0-15)')),
+                  const SnackBar(content: Text('请输入有效的节点ID (1-5)')),
                 );
               }
             },
@@ -620,10 +638,9 @@ class _IndexPageState extends State<IndexPage> {
       width: MediaQuery.of(context).size.width * 0.45,
       child: Row(
         children: [
-          // 历史数据按钮
           Expanded(
             child: SizedBox(
-              height: 200, // 等于卡片高度
+              height: 200,
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.blue,
@@ -632,9 +649,9 @@ class _IndexPageState extends State<IndexPage> {
                   side: const BorderSide(color: Colors.indigo, width: 2),
                 ),
                 onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (context) => const DailyHistoryPage()),
-            ),
+                  context,
+                  MaterialPageRoute(builder: (context) => const DailyHistoryPage()),
+                ),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: const [
@@ -647,10 +664,9 @@ class _IndexPageState extends State<IndexPage> {
             ),
           ),
           const SizedBox(width: 48),
-          // 修改密码按钮
           Expanded(
             child: SizedBox(
-              height: 200, // 等于卡片高度
+              height: 200,
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF5D4037),
@@ -686,7 +702,7 @@ class _IndexPageState extends State<IndexPage> {
           'nodeData': node,
         }),
         child: FutureBuilder<Color>(
-          future: _computeCardColor(node, sensorProvider),
+          future: _computeCardColor(node),
           builder: (context, snapshot) {
             return Container(
               decoration: BoxDecoration(
@@ -709,7 +725,7 @@ class _IndexPageState extends State<IndexPage> {
                   Padding(
                     padding: const EdgeInsets.only(right: 48),
                     child: FutureBuilder<String>(
-                      future: _getDisplayStatus(node, sensorProvider),
+                      future: _getDisplayStatus(node),
                       builder: (context, snapshot) {
                         return Text(
                           snapshot.data ?? '未连接',

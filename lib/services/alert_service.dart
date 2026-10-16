@@ -1,9 +1,9 @@
+import 'dart:async';
+
 import '../models/node_data.dart';
 import 'settings_service.dart';
 import 'ignore_service.dart';
 import 'modbus_tcp_client.dart';
-import 'sensor_data_service.dart';
-import 'csv_logger_service.dart';
 import 'rs485_protocol.dart';
 
 // 预警和故障状态
@@ -42,53 +42,8 @@ class AlertService {
   // Modbus TCP客户端
   final ModbusTcpClient _modbusClient = ModbusTcpClient();
   
-  // SensorDataService 实例（用于获取节点连接状态）
-  SensorDataService? _sensorDataService;
-  
-  // 设置 SensorDataService 实例
-  void setSensorDataService(SensorDataService service) {
-    _sensorDataService = service;
-  }
-  
   // 防重复发送：记录已发送的预警/故障信息
   final Map<String, DateTime> _lastSentAlerts = {};
-  
-  // 超阈值持续计时：key = "nodeId|metric|level"
-  final Map<String, DateTime?> _overThresholdStartTimes = {};
-  // 持续计时开始时的“异常前快照”：key 同上，value 为节点快照 Map
-  final Map<String, Map<String, dynamic>?> _preAlertSnapshots = {};
-  final Map<int, Map<String, dynamic>?> _lastPreAlertSnapshotByNode = {};
-
-  Map<String, dynamic>? getLastPreAlertSnapshot(int nodeId) => _lastPreAlertSnapshotByNode[nodeId];
-  
-  // 判断是否达到持续超阈值时间窗口（例如40秒）
-  bool _shouldTriggerHold(String key, bool isOverThreshold, int holdMs) {
-    final now = DateTime.now();
-    final start = _overThresholdStartTimes[key];
-    if (isOverThreshold) {
-      if (start == null) {
-        _overThresholdStartTimes[key] = now;
-        return false;
-      }
-      return now.difference(start).inMilliseconds >= holdMs;
-    } else {
-      // 条件恢复，清除计时
-      _overThresholdStartTimes[key] = null;
-      return false;
-    }
-  }
-  
-  // 启动Modbus TCP连接监控
-  void startModbusConnection() {
-    _modbusClient.startConnectionMonitoring();
-    print('AlertService: Modbus TCP连接监控已启动');
-  }
-  
-  // 停止Modbus TCP连接监控
-  void stopModbusConnection() {
-    _modbusClient.stopConnectionMonitoring();
-    print('AlertService: Modbus TCP连接监控已停止');
-  }
   
   // 判断是否应该发送预警/故障信息（防重复发送）
   bool _shouldSendAlert(String alertKey) {
@@ -110,6 +65,26 @@ class AlertService {
     }
     
     return true;
+  }
+  // 记录10秒保持开始时的"异常前快照"（CSV写入用）：nodeId -> map
+  final Map<int, Map<String, num>> _lastPreAlertSnapshotByNode = {};
+  Map<String, num>? getLastPreAlertSnapshot(int nodeId) => _lastPreAlertSnapshotByNode[nodeId];
+
+  // 超阈值持续计时（10秒保持）：key = "nodeId|level|hash"
+  final Map<String, DateTime?> _holdStarts = {};
+  bool _shouldHold(String key, bool over, int holdMs) {
+    final now = DateTime.now();
+    final start = _holdStarts[key];
+    if (over) {
+      if (start == null) {
+        _holdStarts[key] = now;
+        return false;
+      }
+      return now.difference(start).inMilliseconds >= holdMs;
+    } else {
+      _holdStarts[key] = null;
+      return false;
+    }
   }
 
   // 湿度预警时间记录
@@ -161,32 +136,27 @@ class AlertService {
     final filteredWarnings = _applyIgnoreRules(nodeData.nodeId.toString(), warnings, 'warning');
     final filteredFaults = _applyIgnoreRules(nodeData.nodeId.toString(), faults, 'fault');
 
-    // 7. 预警和故障都需要持续40秒以上才显示
-    const int warningHoldMs = 40000; // 预警持续40秒
-    const int faultHoldMs = 40000;   // 故障持续40秒
-    final String nodeKey = nodeData.nodeId.toString();
+    // 7. 预警和故障都需要持续10秒以上才显示
+    const int warningHoldMs = 10000; // 预警持续10秒
+    const int faultHoldMs = 10000;   // 故障持续10秒
+    final nodeKey = nodeData.nodeId.toString();
     final heldWarnings = <String>[];
     final heldFaults = <String>[];
     for (final w in filteredWarnings) {
       final key = '$nodeKey|warning|${w.hashCode}';
-      if (_overThresholdStartTimes[key] == null) {
-        // 保存异常前快照
-        final snap = CsvLoggerService.instance.getNodeSnapshot(nodeData.nodeId);
-        final map = snap?.toMap();
-        _preAlertSnapshots[key] = map;
-        _lastPreAlertSnapshotByNode[nodeData.nodeId] = map;
+      // 第一次进入保持，记录异常前快照
+      if (_holdStarts[key] == null) {
+        // 快照留给CSV层读取（在各自服务中实现）
+        _lastPreAlertSnapshotByNode[nodeData.nodeId] = {};
       }
-      if (_shouldTriggerHold(key, true, warningHoldMs)) heldWarnings.add(w);
+      if (_shouldHold(key, true, warningHoldMs)) heldWarnings.add(w);
     }
     for (final f in filteredFaults) {
       final key = '$nodeKey|fault|${f.hashCode}';
-      if (_overThresholdStartTimes[key] == null) {
-        final snap = CsvLoggerService.instance.getNodeSnapshot(nodeData.nodeId);
-        final map = snap?.toMap();
-        _preAlertSnapshots[key] = map;
-        _lastPreAlertSnapshotByNode[nodeData.nodeId] = map;
+      if (_holdStarts[key] == null) {
+        _lastPreAlertSnapshotByNode[nodeData.nodeId] = {};
       }
-      if (_shouldTriggerHold(key, true, faultHoldMs)) heldFaults.add(f);
+      if (_shouldHold(key, true, faultHoldMs)) heldFaults.add(f);
     }
     
     // 确定最终状态
@@ -255,11 +225,11 @@ class AlertService {
     final allTemps = await _getAllTemperaturesWithInnerTemps(nodeData, correctedTemps);
     final maxTemp = allTemps.isNotEmpty ? allTemps.reduce((a, b) => a > b ? a : b) : 0.0;
     print('温度报警检查：最高温度=${maxTemp.toStringAsFixed(1)}°C');
-    
+
     // 新增：80-85度范围内温升增长检测
     final double growthBaseline = tempStart; // 节点特定的温度起点
     final double highTempThreshold = tempWarning; // 节点特定的预警阈值
-    
+
     if (maxTemp >= growthBaseline && maxTemp < highTempThreshold) {
       // 在80-85度范围内，检查温升增长
       print('节点${nodeData.nodeId}在80-85度范围内，检查温升增长');
@@ -272,7 +242,6 @@ class AlertService {
       }
     } else if (maxTemp >= highTempThreshold) {
       // 超过85度，直接预警
-      print('节点${nodeData.nodeId}超过85度，直接预警');
       warnings.add('温度预警：温度${maxTemp.toStringAsFixed(1)}°C超过预警阈值${highTempThreshold}°C');
     } else {
       print('节点${nodeData.nodeId}温度${maxTemp.toStringAsFixed(1)}°C不在温升检测范围内');
@@ -285,50 +254,41 @@ class AlertService {
   // 获取包含中内温度的完整温度数组
   Future<List<double>> _getAllTemperaturesWithInnerTemps(NodeData nodeData, List<double>? correctedTemps) async {
     if (correctedTemps == null || correctedTemps.isEmpty) return [];
-    
+
     final allTemps = <double>[];
-    
+
     // 添加原始PT100温度（9个：左外、中、右外）
     for (int i = 0; i < 9 && i < correctedTemps.length; i++) {
       allTemps.add(correctedTemps[i]);
     }
-    
+
     // 计算并添加中内温度（3个）
     if (correctedTemps.length >= 9) {
       // 计算三相平均值
       final leftAvg = (correctedTemps[0] + correctedTemps[3] + correctedTemps[6]) / 3;   // 左外温度平均值
-      final middleAvg = (correctedTemps[1] + correctedTemps[4] + correctedTemps[7]) / 3; // 中外温度平均值  
-      final rightAvg = (correctedTemps[2] + correctedTemps[5] + correctedTemps[8]) / 3;  // 右外温度平均值
-      
+      final middleAvg = (correctedTemps[1] + correctedTemps[4] + correctedTemps[7]) / 3; // 中外温度平均值
+      final rightAvg= (correctedTemps[2] + correctedTemps[5] + correctedTemps[8]) / 3;  // 右外温度平均值
+
       // 获取环境温度（节点特定）
       final settings = SettingsService();
       final nodeSettings = await settings.getAllSettingsForNode(nodeData.nodeId);
       final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
       final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
       final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
-      
+
       // 计算环境温度
       double upperTemp = 25.0 + upperCorr;
       double middleTemp = (nodeData.temperature ?? 25.0) + middleCorr;
       double lowerTemp = (nodeData.temperature ?? 25.0) + lowerCorr; // 统一使用温湿度传感器温度
-      
-      // 如果有PT100数据，使用PT100通道作为上温度：节点1使用通道10，其他节点使用通道9
-      if (nodeData.pt100Temperatures != null) {
-        if (nodeData.nodeId == 1) {
-          // 节点1使用通道10
-          final pt10Temp = nodeData.pt100Temperatures![10];
-          if (pt10Temp != -999) {
-            upperTemp = pt10Temp + upperCorr;
-          }
-        } else {
-          // 其他节点使用通道9
-          final pt9Temp = nodeData.pt100Temperatures![9];
-          if (pt9Temp != -999) {
-            upperTemp = pt9Temp + upperCorr;
-          }
+
+      // 如果有PT100数据，使用PT100通道9作为上温度
+      if (nodeData.pt100Temperatures != null && nodeData.pt100Temperatures!.length >= 10) {
+        final pt9Temp = nodeData.pt100Temperatures![9];
+        if (pt9Temp != -999) {
+          upperTemp = pt9Temp + upperCorr;
         }
       }
-      
+
       // 如果有PT100数据，使用PT100通道11作为中温度
       if (nodeData.pt100Temperatures != null && nodeData.pt100Temperatures!.length >= 12) {
         final pt11Temp = nodeData.pt100Temperatures![11];
@@ -336,7 +296,7 @@ class AlertService {
           middleTemp = pt11Temp + middleCorr;
         }
       }
-      
+
       // 计算A相中内温度
       final aInner = await _calculateInnerTemp(correctedTemps[1], upperTemp, middleAvg, 'A', nodeData.nodeId);
       allTemps.add(aInner);
@@ -349,8 +309,40 @@ class AlertService {
       final cInner = await _calculateInnerTemp(correctedTemps[7], lowerTemp, middleAvg, 'C', nodeData.nodeId);
       allTemps.add(cInner);
     }
-    
+
     return allTemps;
+  }
+
+  // 计算中内温度
+  Future<double> _calculateInnerTemp(double xi, double x0i, double xia, String phase, int nodeId) async {
+    // 如果外测点温度为开路，内温度也为开路
+    if (xi == -999) return -999;
+    
+    // 当外温度小于环境温度时，中内温度等于中外温度
+    if (xi < x0i) {
+      return xi;
+    }
+    
+    // 获取设置（节点特定）
+    final settings = SettingsService();
+    final nodeSettings = await settings.getAllSettingsForNode(nodeId);
+    double k1, k2;
+    
+    if (phase == 'A') {
+      k1 = nodeSettings['aK1'] as double? ?? 6.42;
+      k2 = nodeSettings['aK2'] as double? ?? 2.5;
+    } else if (phase == 'B') {
+      k1 = nodeSettings['bK1'] as double? ?? 6.42;
+      k2 = nodeSettings['bK2'] as double? ?? 2.5;
+    } else { // C
+      k1 = nodeSettings['cK1'] as double? ?? 6.42;
+      k2 = nodeSettings['cK2'] as double? ?? 2.5;
+    }
+    
+    // 公式：Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)
+    final term1 = k1 * (xi - x0i > 0 ? xi - x0i : 0);
+    final term2 = k2 * (xi - xia > 0 ? xi - xia : 0);
+    return xi + term1 + term2;
   }
 
   // 检查温度增长（80-85度范围内）
@@ -476,20 +468,11 @@ class AlertService {
       double middleTemp = (nodeData.temperature ?? 25.0) + middleCorr;
       double lowerTemp = (nodeData.temperature ?? 25.0) + lowerCorr; // 统一使用温湿度传感器温度
       
-      // 如果有PT100数据，使用PT100通道作为上温度：节点1使用通道10，其他节点使用通道9
-      if (nodeData.pt100Temperatures != null) {
-        if (nodeData.nodeId == 1) {
-          // 节点1使用通道10
-          final pt10Temp = nodeData.pt100Temperatures![10];
-          if (pt10Temp != -999) {
-            upperTemp = pt10Temp + upperCorr;
-          }
-        } else {
-          // 其他节点使用通道9
-          final pt9Temp = nodeData.pt100Temperatures![9];
-          if (pt9Temp != -999) {
-            upperTemp = pt9Temp + upperCorr;
-          }
+      // 如果有PT100数据，使用PT100通道9作为上温度
+      if (nodeData.pt100Temperatures != null && nodeData.pt100Temperatures!.length >= 10) {
+        final pt9Temp = nodeData.pt100Temperatures![9];
+        if (pt9Temp != -999) {
+          upperTemp = pt9Temp + upperCorr;
         }
       }
       
@@ -541,80 +524,19 @@ class AlertService {
   
   // 计算内温度：Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)
   // xi: 外测点温度, x0i: 环境温度, xia: 三相平均值
-  // phase: 相别 ('A', 'B', 'C')
-  Future<double> _calculateInnerTemp(double xi, double x0i, double xia, String phase, int nodeId) async {
-    // 如果外测点温度为开路，内温度也为开路
-    if (xi == -999) return -999;
-    
-    // 当外温度小于环境温度时，中内温度等于中外温度
-    if (xi < x0i) {
-      return xi;
-    }
-    
-    // 获取对应相的k1、k2参数（节点特定）
-    final nodeSettings = await _settingsService.getAllSettingsForNode(nodeId);
-    double k1, k2;
-    switch (phase) {
-      case 'A':
-        k1 = nodeSettings['aK1'] as double? ?? 6.42;
-        k2 = nodeSettings['aK2'] as double? ?? 2.5;
-        break;
-      case 'B':
-        k1 = nodeSettings['bK1'] as double? ?? 6.42;
-        k2 = nodeSettings['bK2'] as double? ?? 2.5;
-        break;
-      case 'C':
-        k1 = nodeSettings['cK1'] as double? ?? 6.42;
-        k2 = nodeSettings['cK2'] as double? ?? 2.5;
-        break;
-      default:
-        k1 = 6.42; // 默认值
-        k2 = 2.5;  // 默认值
-    }
-    
-    // 输入参数验证（仅记录，不限制）
-    if (xi < -50 || xi > 200 || x0i < -50 || x0i > 200 || xia < -50 || xia > 200) {
-      print('⚠️ 中内温度计算输入参数异常: xi=$xi, x0i=$x0i, xia=$xia, 相别=$phase, 节点=$nodeId');
-    }
-    
-    // 对差值进行下限截断：若为负则按0计算
-    final deltaEnv = xi - x0i;
-    final deltaPhaseAvg = xi - xia;
-    final nonNegativeEnv = deltaEnv < 0 ? 0 : deltaEnv;
-    final nonNegativePhaseAvg = deltaPhaseAvg < 0 ? 0 : deltaPhaseAvg;
-    
-    // 应用公式：Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)
-    final y = xi + k1 * nonNegativeEnv + k2 * nonNegativePhaseAvg;
-    
-    // 异常高温检测和调试输出
-    if (y > 200 || y < -50) {
-      print('🚨 中内温度计算结果异常: $y°C');
-      print('   计算公式: Y = xi + k1·max(0, xi – x0i) + k2·max(0, xi – xia)');
-      print('   输入参数: xi=$xi, x0i=$x0i, xia=$xia, 相别=$phase, 节点=$nodeId');
-      print('   计算参数: k1=$k1, k2=$k2');
-      print('   差值计算: deltaEnv=${deltaEnv.toStringAsFixed(6)}, deltaPhaseAvg=${deltaPhaseAvg.toStringAsFixed(6)}');
-      print('   非负值: nonNegativeEnv=${nonNegativeEnv.toStringAsFixed(6)}, nonNegativePhaseAvg=${nonNegativePhaseAvg.toStringAsFixed(6)}');
-      print('   分步计算: xi=$xi + k1×${nonNegativeEnv.toStringAsFixed(6)} + k2×${nonNegativePhaseAvg.toStringAsFixed(6)}');
-      print('   分步结果: $xi + ${(k1 * nonNegativeEnv).toStringAsFixed(6)} + ${(k2 * nonNegativePhaseAvg).toStringAsFixed(6)} = $y');
-    }
-    
-    return y;
-  }
 
   // 检查所有温度点的阈值（保留原方法以防需要）
-  // 注意：此方法已不再使用，被_checkAllTemperatureThresholdsWithInnerTemps替代
-  // 保留此方法以防需要特殊处理，但建议使用带节点特定阈值的新方法
   void _checkAllTemperatureThresholds(List<double> temps, List<String> warnings, List<String> faults) {
     if (temps.isEmpty) return;
     
     // 温度点名称映射
     final List<String> tempNames = [
       'A相左外', 'A相中', 'A相右外', 'A相中内',
-      'B相左外', 'B相中', 'B相右外', 'B相中内',
+      'B相左外', 'B相中', 'B相右外', 'B相中内', 
       'C相左外', 'C相中', 'C相右外', 'C相中内'
     ];
     
-    // 检查每个温度点（使用全局阈值，不推荐）
+    // 检查每个温度点
     for (int i = 0; i < temps.length && i < tempNames.length; i++) {
       final temp = temps[i];
       if (temp == -999) continue; // 跳过开路温度
@@ -770,21 +692,8 @@ class AlertService {
     }
   }
 
-  // 连接状态判断（基于查询判断逻辑）
+  // 连接状态判断
   void _checkConnectionStatus(NodeData nodeData, List<String> warnings, List<String> faults) {
-    // 如果 SensorDataService 可用，使用基于查询判断的连接状态
-    if (_sensorDataService != null) {
-      final isConnected = _sensorDataService!.isNodeConnected(nodeData.nodeId);
-      if (!isConnected) {
-        // 从设置获取超时时间用于显示
-        final disconnectTimeoutMs = _settingsService.nodeDisconnectTimeoutMs;
-        final disconnectTimeoutSec = (disconnectTimeoutMs / 1000).toStringAsFixed(1);
-        faults.add('设备未连接：连续查询无响应且超过${disconnectTimeoutSec}秒未收到数据');
-      }
-      return;
-    }
-    
-    // 备用判断（如果 SensorDataService 不可用）
     final now = DateTime.now().millisecondsSinceEpoch;
     final isStale = (nodeData.lastUpdateTimestamp == null) || 
                    (now - nodeData.lastUpdateTimestamp! > 40000);
@@ -915,6 +824,12 @@ class AlertService {
     
     return result;
   }
+
+  // 启动Modbus TCP连接（兼容性方法）
+  void startModbusConnection() {
+    print('AlertService Modbus连接已启动');
+    _modbusClient.startConnectionMonitoring();
+  }
   
   /// 发送预警/故障485格式报文
   void _sendAlertRS485(NodeData nodeData, String alertDescription, bool isWarning) {
@@ -935,7 +850,6 @@ class AlertService {
       // 从描述中提取数值
       double? value;
       if (alertDescription.contains('温度')) {
-        // 提取温度值
         final match = RegExp(r'(\d+\.?\d*)°C').firstMatch(alertDescription);
         if (match != null) {
           value = double.tryParse(match.group(1) ?? '');
@@ -974,24 +888,22 @@ class AlertService {
       
       // 构建485格式数据：故障码(1) + 数值(2字节，高字节在前，乘以100)
       final data = <int>[];
-      data.add(faultCode); // 故障码
+      data.add(faultCode);
       if (value != null) {
         final intValue = (value * 100).round();
-        data.add((intValue >> 8) & 0xFF); // 高字节
-        data.add(intValue & 0xFF);        // 低字节
+        data.add((intValue >> 8) & 0xFF);
+        data.add(intValue & 0xFF);
       } else {
-        data.add(0x00); // 无数值时填充0
+        data.add(0x00);
         data.add(0x00);
       }
-      
-      // 使用故障码作为传感器编号发送
-      _modbusClient.sendRS485Frame(
+
+      unawaited(_modbusClient.sendRS485Frame(
         nodeId: nodeData.nodeId,
-        sensorId: faultCode, // 使用故障码作为传感器编号
+        sensorId: faultCode,
         data: data,
-      );
-      
-      print('📤 发送${isWarning ? '预警' : '故障'}485报文: 节点=${nodeData.nodeId}, 故障码=0x${faultCode.toRadixString(16)}, 描述=$alertDescription');
+      ));
+      print('📤 ${isWarning ? '预警' : '故障'}已上报: 节点=${nodeData.nodeId}, 故障码=0x${faultCode.toRadixString(16)}, 描述=$alertDescription');
     } catch (e) {
       print('❌ 发送预警/故障485报文失败: $e');
     }
