@@ -10,6 +10,7 @@ import 'alert_service.dart';
 import 'node_data_calculator.dart';
 import 'sensor_data_service.dart';
 import 'rs485_protocol.dart';
+import 'temp_channel_filter.dart';
 import '../models/node_data.dart';
 
 /// Modbus TCP服务器，监听客户端连接，根据请求返回节点数据（485格式）
@@ -31,14 +32,11 @@ class ModbusTcpServer {
   // 缓存每个节点上一次非空的响应数据（用于未连接时返回）
   // key: nodeId, value: 上一次非空的响应数据
   final Map<int, List<int>> _lastValidResponseCache = {};
+  final Map<int, List<int>> _fullRegisterCache = {};
+  final Map<int, AlertInfo> _lastAlerts = {};
+  final Set<int> _cacheBuilding = {};
   
-  // 温度值历史记录（用于异常值过滤）
-  // key: '${nodeId}_${phase}_${channelIndex}', value: 最近的有效温度值列表
-  final Map<String, List<double>> _tempHistoryCache = {};
-  
-  // 温度值异常跳变阈值（°C）
-  static const double _tempJumpThreshold = 10.0; // 超过±10°C的变化认为是异常
-  static const double _tempMinValue = -50.0; // 最小合理温度（去掉上限）
+  final Map<String, TempChannelFilter> _tempFilters = {};
 
   /// 启动服务器
   Future<bool> start() async {
@@ -155,10 +153,6 @@ class ModbusTcpServer {
   /// 异步处理客户端数据
   Future<void> _handleClientDataAsync(Socket client, Uint8List data) async {
     try {
-      // 打印完整接收数据（十六进制）用于调试
-      final hexString = data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
-      print('🔍 收到完整数据（${data.length}字节）: $hexString');
-      
       if (data.length < 8) {
         print('⚠️ 数据长度不足: ${data.length}');
         return;
@@ -208,20 +202,14 @@ class ModbusTcpServer {
         print('⚠️ 寄存器数量超出范围，已限制: 请求数量=$quantity (0x${quantity.toRadixString(16).padLeft(4, '0')}), 实际返回=$actualQuantity (0x${actualQuantity.toRadixString(16).padLeft(4, '0')}), 最大地址=$maxAddress (0x${maxAddress.toRadixString(16).padLeft(4, '0')})');
       }
 
-      // 生成响应数据（485格式）
-      final responseData = await _generateNodeDataResponse(unitId, startAddress, actualQuantity);
-
+      var responseData = _sliceFullCache(unitId, startAddress, actualQuantity);
+      if (responseData.isEmpty) {
+        responseData = List<int>.from(_lastValidResponseCache[unitId] ?? const <int>[]);
+      }
+      unawaited(_rebuildFullCache(unitId));
       if (responseData.isEmpty) {
         print('⚠️ 无法生成节点$unitId的响应数据（起始地址=$startAddress, 数量=$actualQuantity）');
-        // 如果无法生成数据，尝试返回上一次正常的数据
-        if (_lastValidResponseCache.containsKey(unitId) && _lastValidResponseCache[unitId]!.isNotEmpty) {
-          print('📦 节点$unitId数据为空，返回上一次正常数据（缓存长度=${_lastValidResponseCache[unitId]!.length}）');
-          _sendResponse(client, transactionId, unitId, functionCode, _lastValidResponseCache[unitId]!);
-          return;
-        }
-        // 如果缓存也没有，才发送错误响应
-        print('❌ 节点$unitId无数据且无缓存，发送错误响应');
-        _sendErrorResponse(client, transactionId, unitId, functionCode, 0x02); // 非法数据地址
+        _sendErrorResponse(client, transactionId, unitId, functionCode, 0x02);
         return;
       }
 
@@ -229,6 +217,33 @@ class ModbusTcpServer {
       _sendResponse(client, transactionId, unitId, functionCode, responseData);
     } catch (e) {
       print('❌ 处理客户端数据失败: $e');
+    }
+  }
+
+  List<int> _sliceFullCache(int nodeId, int startAddress, int quantity) {
+    final full = _fullRegisterCache[nodeId];
+    if (full == null || full.length < 2) return const <int>[];
+    final from = startAddress * 2;
+    final to = (startAddress + quantity) * 2;
+    if (from < 0 || to > full.length || from >= to) return const <int>[];
+    return full.sublist(from, to);
+  }
+
+  void scheduleCacheRebuild(int nodeId) {
+    unawaited(_rebuildFullCache(nodeId));
+  }
+
+  Future<void> _rebuildFullCache(int nodeId) async {
+    if (!_cacheBuilding.add(nodeId)) return;
+    try {
+      await Future<void>.delayed(Duration.zero);
+      final bytes = await _generateNodeDataResponse(nodeId, 0, 36);
+      if (bytes.length >= 72) {
+        _fullRegisterCache[nodeId] = List<int>.from(bytes);
+      }
+    } catch (_) {
+    } finally {
+      _cacheBuilding.remove(nodeId);
     }
   }
 
@@ -320,19 +335,8 @@ class ModbusTcpServer {
         _loadSettingsToCache(nodeId);
       }
 
-      // 获取节点预警/故障状态
-      // 从快照转换为NodeData，然后分析预警/故障
-      AlertInfo? alerts;
-      try {
-        final nodeData = _snapshotToNodeData(snapshot, nodeId);
-        if (nodeData != null) {
-          final alertService = AlertService();
-          alerts = await alertService.analyzeNodeData(nodeData);
-        }
-      } catch (e) {
-        print('⚠️ 获取节点预警/故障状态失败: $e');
-        alerts = null;
-      }
+      // 请求路径不再现场分析预警，避免卡住 RS485 轮询
+      final AlertInfo? alerts = _lastAlerts[nodeId];
 
       // 根据起始地址和数量，生成对应的数据
       // 寄存器映射（统一为36个寄存器格式，与sensor_flutter67一致）：
@@ -1032,6 +1036,10 @@ class ModbusTcpServer {
       // 从displayData获取相温度数据（与页面显示完全一致）
       final phaseTemps = displayData['phase$phase'] as List<double>?;
       if (phaseTemps == null || phaseTemps.length < 4) {
+        if (offset == 1 || offset == 2 || offset == 4 || offset == 6) {
+          final ch = offset == 1 ? 0 : offset == 2 ? 1 : offset == 4 ? 2 : 3;
+          return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, ch, -999.0));
+        }
         return [0, 0];
       }
 
@@ -1056,61 +1064,21 @@ class ModbusTcpServer {
         data.add(0); // 高字节为0
         data.add(statusLeft); // 低字节为状态值
       } else if (offset == 1) {
-        // 左外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 0, leftOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 0, leftOuter));
       } else if (offset == 2) {
-        // 中外温度值（无状态，应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 1, middleOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 1, middleOuter));
       } else if (offset == 3) {
         // 右外温度状态（转换为简单状态值：0=正常，1=预警，2=故障，3=局放值故障）
         data.add(0); // 高字节为0
         data.add(statusRight); // 低字节为状态值
       } else if (offset == 4) {
-        // 右外温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 2, rightOuter);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 2, rightOuter));
       } else if (offset == 5) {
         // 中内温度状态（转换为简单状态值：0=正常，1=预警，2=故障）
         data.add(0); // 高字节为0
         data.add(statusInner); // 低字节为状态值
       } else if (offset == 6) {
-        // 中内温度值（应用异常值过滤）
-        final filteredTemp = _filterTemperatureValue(nodeId, phase, 3, middleInner);
-        int raw;
-        if (filteredTemp == -999.0) {
-          raw = 0x8066;
-        } else {
-          final signedRaw = (filteredTemp / 0.01).round();
-          raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
-        }
-        data.add((raw >> 8) & 0xFF);
-        data.add(raw & 0xFF);
+        return _encodeTempRegister(_filterTemperatureValue(nodeId, phase, 3, middleInner));
       } else {
         data.add(0);
         data.add(0);
@@ -1123,69 +1091,28 @@ class ModbusTcpServer {
     }
   }
 
-  /// 过滤温度异常值
-  /// nodeId: 节点ID
-  /// phase: 相（A/B/C/ENV）
-  /// channelIndex: 通道索引（0=左外/上温度，1=中外/中温度，2=右外/下温度，3=中内）
-  /// rawTemp: 原始温度值
-  /// 返回：过滤后的温度值
+  List<int> _encodeTempRegister(double filteredTemp) {
+    int raw;
+    if (filteredTemp == -999.0) {
+      raw = 0x8066;
+    } else {
+      final signedRaw = (filteredTemp / 0.01).round();
+      raw = signedRaw < 0 ? (signedRaw + 65536) : signedRaw;
+    }
+    return [(raw >> 8) & 0xFF, raw & 0xFF];
+  }
+
   double _filterTemperatureValue(int nodeId, String phase, int channelIndex, double rawTemp) {
-    // 1. 处理开路值
-    if (rawTemp == -999.0) {
-      return -999.0;
-    }
-    
-    // 2. 基本范围检查（只检查下限，去掉上限）
-    if (rawTemp < _tempMinValue) {
-      print('⚠️ 温度值超出范围: 节点=$nodeId, 相=$phase, 通道=$channelIndex, 原始值=$rawTemp°C, 最小范围=$_tempMinValue°C');
-      // 返回历史值或默认值
-      final historyKey = '${nodeId}_${phase}_$channelIndex';
-      final history = _tempHistoryCache[historyKey];
-      if (history != null && history.isNotEmpty) {
-        final lastValidValue = history.last;
-        print('📊 使用历史值: $lastValidValue°C');
-        return lastValidValue;
-      }
-      return 25.0; // 默认值
-    }
-    
-    // 3. 获取历史记录
-    final historyKey = '${nodeId}_${phase}_$channelIndex';
-    final history = _tempHistoryCache.putIfAbsent(historyKey, () => <double>[]);
-    
-    // 4. 如果没有历史数据，直接使用当前值
-    if (history.isEmpty) {
-      history.add(rawTemp);
-      // 限制历史记录长度（最多保留10个）
-      if (history.length > 10) {
-        history.removeAt(0);
-      }
-      return rawTemp;
-    }
-    
-    // 5. 获取最近的有效值
-    final lastValue = history.last;
-    
-    // 6. 检测异常跳变
-    final absDiff = (rawTemp - lastValue).abs();
-    if (absDiff > _tempJumpThreshold) {
-      print('⚠️ 温度异常跳变检测: 节点=$nodeId, 相=$phase, 通道=$channelIndex, 从$lastValue°C跳变到$rawTemp°C (变化=${absDiff.toStringAsFixed(1)}°C)');
-      // 使用上一次的有效值
-      history.add(lastValue); // 继续使用上次的值
-      // 限制历史记录长度
-      if (history.length > 10) {
-        history.removeAt(0);
-      }
-      return lastValue;
-    }
-    
-    // 7. 正常变化，使用当前值
-    history.add(rawTemp);
-    // 限制历史记录长度
-    if (history.length > 10) {
-      history.removeAt(0);
-    }
-    return rawTemp;
+    final key = '${nodeId}_${phase}_$channelIndex';
+    final isInner = channelIndex == 3;
+    final filter = _tempFilters.putIfAbsent(
+      key,
+      () => TempChannelFilter(
+        maxStep: isInner ? 3.0 : 1.5,
+        confirmCount: 6,
+      ),
+    );
+    return filter.filter(rawTemp);
   }
 
   /// 获取环境参数单个寄存器的值（统一为36寄存器格式，使用与页面显示一致的数据）

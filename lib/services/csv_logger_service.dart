@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'sensor_data_service.dart';
 import 'alert_service.dart';
 import 'settings_service.dart';
+import 'serial_debug_logger.dart';
 import '../models/node_data.dart';
 
 class CsvLoggerService {
@@ -18,10 +19,13 @@ class CsvLoggerService {
   final Map<int, int> _lastWrittenEpochSecondByNode = <int, int>{};
   final Map<int, SensorData> _latestByNode = <int, SensorData>{};
   final Map<int, DateTime?> _currentDateByNode = <int, DateTime?>{}; // 每个节点的当前日期
-  final Map<int, File?> _currentFileByNode = <int, File?>{}; // 每个节点的当前文件
+  final Map<int, File?> _currentFileByNode = <int, File?>{};
+  final List<Directory> _logDirs = [];
+  final Set<int> _flushingNodes = <int>{};
   bool _isConnected = false;
   Timer? _flushTimer;
-  String? _customLogsPath; // 自定义日志保存路径
+  String? _customLogsPath;
+  String? displayPath;
   
   // 历史数据发送回调
   Function(int nodeId, dynamic data)? _onHistoryDataSend;
@@ -42,9 +46,16 @@ class CsvLoggerService {
   Future<void> initialize() async {
     final prefs = await SharedPreferences.getInstance();
     _customLogsPath = prefs.getString('custom_logs_path');
-    if (_customLogsPath != null) {
-      print('[CSV] 使用自定义日志路径: $_customLogsPath');
+    await _resolveLogDirs();
+    for (final nodeId in const [8, 9]) {
+      try {
+        await _ensureNodeTodayFile(nodeId);
+        await _allNodeRawFiles(nodeId, DateTime.now());
+      } catch (e) {
+        print('[CSV] 预创建节点$nodeId文件失败: $e');
+      }
     }
+    print('[CSV] 数据记录目录: $displayPath');
   }
 
   // 设置自定义日志保存路径
@@ -57,6 +68,7 @@ class CsvLoggerService {
     // 重置当前文件引用，下次访问时会使用新路径
     _currentFileByNode.clear();
     _currentDateByNode.clear();
+    await _resolveLogDirs();
   }
 
   // 获取当前日志保存路径
@@ -71,10 +83,9 @@ class CsvLoggerService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('custom_logs_path');
     print('[CSV] 重置为默认路径');
-    
-    // 重置当前文件引用
     _currentFileByNode.clear();
     _currentDateByNode.clear();
+    await _resolveLogDirs();
   }
 
   void start() {
@@ -82,40 +93,18 @@ class CsvLoggerService {
       print('[CSV] 定时器已在运行，跳过重复启动');
       return;
     }
+    unawaited(_resolveLogDirs());
     _flushTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
       try {
-        final now = DateTime.now();
-        final epochMin = now.millisecondsSinceEpoch ~/ (1000 * 60); // 分钟级别时间戳
-        // ignore: avoid_print
-        print('[CSV] 定时器触发 - 时间:${now.toIso8601String()}, 分钟时间戳:$epochMin');
-        // 为每个节点写入当前快照（每分钟一次）
-        for (final entry in _latestByNode.entries) {
-          final nodeId = entry.key;
-          final snap = entry.value;
-          final last = _lastWrittenEpochSecondByNode[nodeId];
-          if (last != null && last == epochMin) {
-            // ignore: avoid_print
-            print('[CSV] skip write (same minute) node=$nodeId min=$epochMin');
-            continue;
-          }
-          _lastWrittenEpochSecondByNode[nodeId] = epochMin;
-          final merged = _materializeSnapshot(nodeId, snap);
-          final status = _computeStatus(merged);
-          final line = await _toCsvLine(now, merged, status);
-          final file = await _ensureNodeTodayFile(nodeId);
-          await file.writeAsString(line, mode: FileMode.append, flush: true, encoding: utf8);
-          // ignore: avoid_print
-          print('[CSV] 保存数据到CSV - 节点:$nodeId 状态:$status 时间:${now.toIso8601String()}');
-          
-          // 不再向远端服务器发送每分钟历史数据（仅本地CSV保存）
+        for (final nodeId in _latestByNode.keys.toList()) {
+          await _flushNode(nodeId);
         }
       } catch (e) {
-        // ignore: avoid_print
         print('[CSV] periodic flush failed: $e');
+        unawaited(SerialDebugLogger.instance.log('[CSV] 定时写入失败: $e'));
       }
     });
-    // ignore: avoid_print
-    print('[CSV] CSV保存定时器已启动 - 每分钟保存一次数据');
+    print('[CSV] CSV保存已启动 - 有数据立即写首条，之后每分钟一条');
   }
 
   void stop() {
@@ -124,29 +113,125 @@ class CsvLoggerService {
     print('[CSV] CSV保存定时器已停止');
   }
 
-  Future<Directory> _getLogsDir() async {
-    // 如果有自定义路径，使用自定义路径
-    if (_customLogsPath != null) {
-      final logs = Directory(_customLogsPath!);
-      if (!await logs.exists()) {
+  Future<void> _resolveLogDirs() async {
+    _logDirs.clear();
+    Future<void> addDir(String path) async {
+      try {
+        final logs = Directory(path);
         await logs.create(recursive: true);
+        if (_logDirs.any((d) => d.path == logs.path)) return;
+        _logDirs.add(logs);
+      } catch (e) {
+        print('[CSV] 无法使用目录 $path: $e');
       }
-      return logs;
     }
-    
-    // 否则使用默认路径
+
+    if (_customLogsPath != null) {
+      await addDir(_customLogsPath!);
+    }
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      await addDir('${docs.path}${Platform.pathSeparator}logs');
+    } catch (_) {}
+    try {
+      final ext = await getExternalStorageDirectory();
+      if (ext != null) {
+        await addDir('${ext.path}${Platform.pathSeparator}电缆接头数据');
+      }
+    } catch (_) {}
+    if (Platform.isAndroid) {
+      await addDir('/storage/emulated/0/Download/电缆接头数据');
+      await addDir('/storage/emulated/0/Documents/电缆接头数据');
+      await addDir('/storage/emulated/0/Android/data/com.example.sensor_flutter/files/电缆接头数据');
+    }
+    displayPath = _logDirs.isEmpty ? '数据目录创建失败' : _logDirs.map((d) => d.path).join(' | ');
+  }
+
+  Future<Directory> _getLogsDir() async {
+    if (_logDirs.isEmpty) {
+      await _resolveLogDirs();
+    }
+    if (_logDirs.isNotEmpty) return _logDirs.first;
     final dir = await getApplicationDocumentsDirectory();
     final logs = Directory('${dir.path}${Platform.pathSeparator}logs');
-    if (!await logs.exists()) {
-      await logs.create(recursive: true);
-    }
+    await logs.create(recursive: true);
     return logs;
+  }
+
+  Future<List<File>> _allNodeTodayFiles(int nodeId) async {
+    if (_logDirs.isEmpty) {
+      await _resolveLogDirs();
+    }
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final nodeName = _nodeFolderName(nodeId);
+    final files = <File>[];
+    for (final base in _logDirs) {
+      try {
+        final nodeDir = Directory('${base.path}${Platform.pathSeparator}$nodeName');
+        await nodeDir.create(recursive: true);
+        final file = File('${nodeDir.path}${Platform.pathSeparator}${_nodeCsvName(nodeId, today)}');
+        if (!await file.exists()) {
+          await file.create(recursive: true);
+          await file.writeAsString(_buildHeaderLine(), mode: FileMode.write, flush: true, encoding: utf8);
+        }
+        files.add(file);
+      } catch (e) {
+        print('[CSV] 创建${base.path}/$nodeName 失败: $e');
+      }
+    }
+    return files;
+  }
+
+  Future<void> _flushNode(int nodeId) async {
+    if (_flushingNodes.contains(nodeId)) return;
+    final snap = _latestByNode[nodeId];
+    if (snap == null) return;
+    final now = DateTime.now();
+    final epochMin = now.millisecondsSinceEpoch ~/ (1000 * 60);
+    final last = _lastWrittenEpochSecondByNode[nodeId];
+    if (last != null && last == epochMin) return;
+    _flushingNodes.add(nodeId);
+    _lastWrittenEpochSecondByNode[nodeId] = epochMin;
+    try {
+      final merged = _materializeSnapshot(nodeId, snap);
+      final status = _computeStatus(merged);
+      if (status == 'EMPTY' || status == 'INVALID') {
+        _lastWrittenEpochSecondByNode.remove(nodeId);
+        return;
+      }
+      String line;
+      try {
+        line = await _toCsvLine(now, merged, status);
+      } catch (e) {
+        unawaited(SerialDebugLogger.instance.log('[CSV] 组装行失败，本分钟跳过: $e'));
+        _lastWrittenEpochSecondByNode.remove(nodeId);
+        return;
+      }
+      final files = await _allNodeTodayFiles(nodeId);
+      if (files.isEmpty) {
+        throw Exception('没有任何可写的数据目录');
+      }
+      for (final file in files) {
+        await file.writeAsString(line, mode: FileMode.append, flush: true, encoding: utf8);
+      }
+      _currentFileByNode[nodeId] = files.first;
+      _currentDateByNode[nodeId] = DateTime(now.year, now.month, now.day);
+      unawaited(SerialDebugLogger.instance.log(
+          '[CSV] 节点$nodeId 已写入 ${files.length} 个文件 状态=$status 例:${files.first.path}'));
+      _sendHistoryDataToServer(nodeId, merged);
+    } catch (e) {
+      _lastWrittenEpochSecondByNode.remove(nodeId);
+      unawaited(SerialDebugLogger.instance.log('[CSV] 节点$nodeId 写入失败: $e'));
+    } finally {
+      _flushingNodes.remove(nodeId);
+    }
   }
 
   // 获取指定节点的日志目录
   Future<Directory> _getNodeLogsDir(int nodeId) async {
     final baseDir = await _getLogsDir();
-    final nodeDir = Directory('${baseDir.path}${Platform.pathSeparator}node_${nodeId.toString().padLeft(2, '0')}');
+    final nodeDir = Directory('${baseDir.path}${Platform.pathSeparator}${_nodeFolderName(nodeId)}');
     if (!await nodeDir.exists()) {
       await nodeDir.create(recursive: true);
     }
@@ -155,47 +240,15 @@ class CsvLoggerService {
 
   // 为指定节点确保当天文件存在
   Future<File> _ensureNodeTodayFile(int nodeId) async {
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final currentDate = _currentDateByNode[nodeId];
-    final currentFile = _currentFileByNode[nodeId];
-    
-    if (currentDate == null || today.isAfter(currentDate)) {
-      // 新的一天或首次
-      _currentDateByNode[nodeId] = today;
-      final dir = await _getNodeLogsDir(nodeId);
-      final name = _dateToName(today);
-      final file = File('${dir.path}${Platform.pathSeparator}$name.csv');
-      _currentFileByNode[nodeId] = file;
-      
-      if (!await file.exists()) {
-        await file.create(recursive: true);
-        await file.writeAsString(_buildHeaderLine(), mode: FileMode.write, flush: true, encoding: utf8);
-        // ignore: avoid_print
-        print('[CSV] created node file: ${file.path}');
-      } else {
-        // 检查现有文件是否包含新列
-        await _checkAndUpdateNodeHeader(file);
-      }
-    } else if (currentFile == null) {
-      final dir = await _getNodeLogsDir(nodeId);
-      final name = _dateToName(today);
-      final file = File('${dir.path}${Platform.pathSeparator}$name.csv');
-      _currentFileByNode[nodeId] = file;
-      
-      if (!await file.exists()) {
-        await file.create(recursive: true);
-        await file.writeAsString(_buildHeaderLine(), mode: FileMode.write, flush: true, encoding: utf8);
-        // ignore: avoid_print
-        print('[CSV] created node file: ${file.path}');
-      } else {
-        // 检查现有文件是否包含新列
-        await _checkAndUpdateNodeHeader(file);
-      }
+    final files = await _allNodeTodayFiles(nodeId);
+    if (files.isEmpty) {
+      throw Exception('无法创建节点$nodeId数据文件');
     }
-    // ignore: avoid_print
-    print('[CSV] using node file: ${_currentFileByNode[nodeId]!.path}');
-    return _currentFileByNode[nodeId]!;
+    final now = DateTime.now();
+    _currentFileByNode[nodeId] = files.first;
+    _currentDateByNode[nodeId] = DateTime(now.year, now.month, now.day);
+    print('[CSV] using node file: ${files.first.path}');
+    return files.first;
   }
 
   // 检查并更新节点CSV文件头部
@@ -227,6 +280,61 @@ class CsvLoggerService {
   String _dateToName(DateTime d) {
     String to2(int n) => n < 10 ? '0$n' : '$n';
     return '${d.year}-${to2(d.month)}-${to2(d.day)}';
+  }
+
+  String _nodeFolderName(int nodeId) => '节点$nodeId';
+
+  String _legacyNodeFolderName(int nodeId) =>
+      'node_${nodeId.toString().padLeft(2, '0')}';
+
+  String _nodeCsvName(int nodeId, DateTime date) =>
+      '节点${nodeId}_${_dateToName(date)}.csv';
+
+  Future<void> _rawWriteChain = Future.value();
+
+  String _nodeRawCsvName(int nodeId, DateTime date) =>
+      '节点${nodeId}_${_dateToName(date)}_raw.csv';
+
+  Future<List<File>> _allNodeRawFiles(int nodeId, DateTime date) async {
+    if (_logDirs.isEmpty) {
+      await _resolveLogDirs();
+    }
+    final nodeName = _nodeFolderName(nodeId);
+    final files = <File>[];
+    for (final base in _logDirs) {
+      try {
+        final nodeDir = Directory('${base.path}${Platform.pathSeparator}$nodeName');
+        await nodeDir.create(recursive: true);
+        final file = File('${nodeDir.path}${Platform.pathSeparator}${_nodeRawCsvName(nodeId, date)}');
+        if (!await file.exists()) {
+          await file.create(recursive: true);
+          await file.writeAsString(
+            'time,epoch_ms,node_id,direction,hex_data\n',
+            mode: FileMode.write,
+            flush: true,
+            encoding: utf8,
+          );
+        }
+        files.add(file);
+      } catch (e) {
+        print('[CSV] 创建收发记录失败 ${base.path}/$nodeName: $e');
+      }
+    }
+    return files;
+  }
+
+  List<String> _nodeCsvRelativeCandidates(int nodeId, DateTime date) {
+    final dateName = _dateToName(date);
+    final csvName = _nodeCsvName(nodeId, date);
+    final folder = _nodeFolderName(nodeId);
+    final legacyFolder = _legacyNodeFolderName(nodeId);
+    final sep = Platform.pathSeparator;
+    return [
+      '$folder$sep$csvName',
+      '$legacyFolder$sep$dateName.csv',
+      '$legacyFolder$sep$csvName',
+      '$folder$sep$dateName.csv',
+    ];
   }
 
   String _buildHeaderLine() {
@@ -273,35 +381,41 @@ class CsvLoggerService {
 
   // 更新节点快照：把非空字段合并到最新
   void updateNodeSnapshot(SensorData incoming) {
+    if (incoming.nodeId != 8 && incoming.nodeId != 9) {
+      return;
+    }
     final current = _latestByNode[incoming.nodeId];
     if (current == null) {
       _latestByNode[incoming.nodeId] = incoming;
-      return;
+    } else {
+      _latestByNode[incoming.nodeId] = SensorData(
+        nodeId: incoming.nodeId,
+        sensorType: current?.sensorType ?? incoming.sensorType,
+        timestamp: incoming.timestamp,
+        temperature: incoming.temperature ?? current.temperature,
+        humidity: incoming.humidity ?? current.humidity,
+        coPpm: incoming.coPpm ?? current.coPpm,
+        h2Percentage: incoming.h2Percentage ?? current.h2Percentage,
+        pressureKpa: incoming.pressureKpa ?? current.pressureKpa,
+        pressureTempC: incoming.pressureTempC ?? current.pressureTempC,
+        smokeStatus: incoming.smokeStatus ?? current.smokeStatus,
+        smokeExternalTempC: incoming.smokeExternalTempC ?? current.smokeExternalTempC,
+        smokeChannelA: incoming.smokeChannelA ?? current.smokeChannelA,
+        smokeChannelB: incoming.smokeChannelB ?? current.smokeChannelB,
+        pt100Temperatures: _mergePt100(incoming.pt100Temperatures, current.pt100Temperatures),
+        fanStatus: incoming.fanStatus ?? current.fanStatus,
+        fanTimer: incoming.fanTimer ?? current.fanTimer,
+        stCoLen: incoming.stCoLen ?? current.stCoLen,
+        stSmokeLen: incoming.stSmokeLen ?? current.stSmokeLen,
+        stH2Len: incoming.stH2Len ?? current.stH2Len,
+        stPt100Len: incoming.stPt100Len ?? current.stPt100Len,
+        stThLen: incoming.stThLen ?? current.stThLen,
+        stPressureLen: incoming.stPressureLen ?? current.stPressureLen,
+      );
     }
-    _latestByNode[incoming.nodeId] = SensorData(
-      nodeId: incoming.nodeId,
-      sensorType: incoming.sensorType, // 最近一次来源
-      timestamp: incoming.timestamp,
-      temperature: incoming.temperature ?? current.temperature,
-      humidity: incoming.humidity ?? current.humidity,
-      coPpm: incoming.coPpm ?? current.coPpm,
-      h2Percentage: incoming.h2Percentage ?? current.h2Percentage,
-      pressureKpa: incoming.pressureKpa ?? current.pressureKpa,
-      pressureTempC: incoming.pressureTempC ?? current.pressureTempC,
-      smokeStatus: incoming.smokeStatus ?? current.smokeStatus,
-      smokeExternalTempC: incoming.smokeExternalTempC ?? current.smokeExternalTempC,
-      smokeChannelA: incoming.smokeChannelA ?? current.smokeChannelA,
-      smokeChannelB: incoming.smokeChannelB ?? current.smokeChannelB,
-      pt100Temperatures: _mergePt100(incoming.pt100Temperatures, current.pt100Temperatures),
-      fanStatus: incoming.fanStatus ?? current.fanStatus,
-      fanTimer: incoming.fanTimer ?? current.fanTimer,
-      stCoLen: incoming.stCoLen ?? current.stCoLen,
-      stSmokeLen: incoming.stSmokeLen ?? current.stSmokeLen,
-      stH2Len: incoming.stH2Len ?? current.stH2Len,
-      stPt100Len: incoming.stPt100Len ?? current.stPt100Len,
-      stThLen: incoming.stThLen ?? current.stThLen,
-      stPressureLen: incoming.stPressureLen ?? current.stPressureLen,
-    );
+    if (_lastWrittenEpochSecondByNode[incoming.nodeId] == null) {
+      unawaited(_flushNode(incoming.nodeId));
+    }
   }
 
   // 获取节点最新快照
@@ -335,105 +449,108 @@ class CsvLoggerService {
   }
 
   Future<String> _toCsvLine(DateTime now, SensorData d, String status) async {
-    // ignore: avoid_print
-    print('[CSV] _toCsvLine被调用 - 节点:${d.nodeId} 时间:${now.toIso8601String()}');
     String fmtNum(num? v) => v == null ? '' : v.toString();
-    
-    // 格式化函数：根据数据类型应用不同的小数位数
-    String fmtTemp(num? v) => v == null ? '' : v.toStringAsFixed(2);
+    String fmtTemp(num? v) => v == null || v == -999 ? '' : v.toStringAsFixed(2);
     String fmtH2(num? v) => v == null ? '' : v.toStringAsFixed(2);
     String fmtSmoke(num? v) => v == null ? '' : v.toStringAsFixed(2);
     String fmtHumidity(num? v) => v == null ? '' : v.toStringAsFixed(1);
     String fmtPressure(num? v) => v == null ? '' : v.toStringAsFixed(1);
     String fmtCO(num? v) => v == null ? '' : v.toStringAsFixed(1);
     final timeText = now.toIso8601String();
-    final pt = _pt10(d.pt100Temperatures);
+    final pt = _pt12(d.pt100Temperatures);
     final cores = _computePhaseCores(pt, d.temperature, d.pressureTempC);
-    
-    // 获取预警和故障信息
-    final nodeData = _sensorDataToNodeData(d);
-    final alertSvc = AlertService();
-    final alertInfo = await alertSvc.analyzeNodeData(nodeData);
-    final warnings = alertInfo.warnings.isEmpty ? '无' : alertInfo.warnings.join(';');
-    final faults = alertInfo.faults.isEmpty ? '无' : alertInfo.faults.join(';');
-    
-    // 调试信息
-    if (warnings.isNotEmpty || faults.isNotEmpty) {
-      // ignore: avoid_print
-      print('[CSV] Node ${d.nodeId} - Warnings: $warnings, Faults: $faults');
+
+    final nodeSettings = await SettingsService().getAllSettingsForNode(d.nodeId);
+    double _thr(dynamic v, double fallback) {
+      final n = (v as num?)?.toDouble();
+      if (n == null || n <= 0) return fallback;
+      return n;
     }
-    
-    // 若有预/故障，优先使用异常前快照
-    Map<String, num>? preSnap;
-    if (alertInfo.level.toString() != 'AlertLevel.normal') {
-      preSnap = alertSvc.getLastPreAlertSnapshot(d.nodeId);
-    }
-    num _pick(Map<String, num>? m, String k, num fallback) {
-      if (m == null) return fallback;
-      return m[k] ?? fallback;
-    }
-    // 计算上中下温度
+    final tempWarning = _thr(nodeSettings['tempWarning'], 85);
+    final tempFault = _thr(nodeSettings['tempFault'], 90);
+
     final defUpper = pt.length >= 10 && pt[9] != null && pt[9] != -999 ? pt[9]! : (d.temperature ?? 25);
-    final upperTemp = preSnap != null ? _pick(preSnap, 'upper_temp', defUpper) : defUpper;
     final defMiddle = pt.length >= 12 && pt[11] != null && pt[11] != -999 ? pt[11]! : (d.temperature ?? 25);
-    final middleTemp = preSnap != null ? _pick(preSnap, 'middle_temp', defMiddle) : defMiddle;
-    final defLower = d.temperature ?? 25; // 下温度=温湿度传感器温度（与详细页面一致）
-    final lowerTemp = preSnap != null ? _pick(preSnap, 'lower_temp', defLower) : defLower;
-    
-    // 烟雾通道处理
-    final whiteSmoke = preSnap != null ? _pick(preSnap, 'white_smoke', _processSmokeChannel(d.smokeChannelA) ?? 0) : _processSmokeChannel(d.smokeChannelA);
-    final blackSmoke = preSnap != null ? _pick(preSnap, 'black_smoke', _processSmokeChannel(d.smokeChannelB) ?? 0) : _processSmokeChannel(d.smokeChannelB);
-    
-    // 烟雾通道处理：若有温度（smoke_external_temp_c）与A/B通道，保留原值；
-    // 如需"处理后数据"，可在此处应用换算或归一化并替换 channelA/channelB 的输出
-    // 湿度修正
+    final defLower = d.temperature ?? 25;
+    final upperTemp = defUpper;
+    final middleTemp = defMiddle;
+    final lowerTemp = defLower;
+
+    final whiteSmoke = _processSmokeChannel(d.smokeChannelA);
+    final blackSmoke = _processSmokeChannel(d.smokeChannelB);
+
     double? humidityCorrected;
     if (d.humidity != null) {
-      final nodeSettings = await SettingsService().getAllSettingsForNode(d.nodeId);
       final corr = nodeSettings['humidityCorrection'] as double? ?? 0.0;
       humidityCorrected = ((d.humidity! + corr)).clamp(0, 100).toDouble();
     }
 
+    final names = <String, num?>{
+      '上': upperTemp,
+      '中': middleTemp,
+      '下': lowerTemp,
+      'A相左外': pt[0],
+      'A相中': pt[1],
+      'A相右外': pt[2],
+      'B相左外': pt[3],
+      'B相中': pt[4],
+      'B相右外': pt[5],
+      'C相左外': pt[6],
+      'C相中': pt[7],
+      'C相右外': pt[8],
+      'A相中内': cores[0],
+      'B相中内': cores[1],
+      'C相中内': cores[2],
+    };
+    final warnings = <String>[];
+    final faults = <String>[];
+    names.forEach((name, t) {
+      if (t == null || t == -999) return;
+      if (t >= tempFault) {
+        faults.add('$name温度故障：${t.toStringAsFixed(1)}°C');
+      } else if (t >= tempWarning) {
+        warnings.add('$name温度预警：${t.toStringAsFixed(1)}°C');
+      }
+    });
+
     final row = [
-      timeText,                                    // 0: 时间
-      now.millisecondsSinceEpoch.toString(),      // 1: 毫秒时间戳
-      d.nodeId.toString(),                        // 2: 节点
-      d.sensorType.toString(),                    // 3: 传感器类型
-      fmtTemp(upperTemp),                         // 4: 上温度(°C)
-      fmtTemp(middleTemp),                        // 5: 中温度(°C)
-      fmtTemp(lowerTemp),                         // 6: 下温度(°C)
-      fmtHumidity(humidityCorrected),             // 7: 湿度(%RH)
-      fmtCO(d.coPpm),                             // 8: CO(ppm)
-      fmtH2(d.h2Percentage),                      // 9: H2(%LEL)
-      fmtPressure(d.pressureKpa),                 // 10: 压力(kPa)
-      fmtNum(d.smokeStatus),                      // 11: 烟雾状态(隐藏)
-      fmtTemp(d.smokeExternalTempC),              // 12: 烟雾外温(°C)
-      fmtSmoke(whiteSmoke),                       // 13: 白烟
-      fmtSmoke(blackSmoke),                       // 14: 黑烟
-      // 15-23: A/B/C相左中右温度 (PT1-PT9)
-      fmtTemp(pt[0]), fmtTemp(pt[1]), fmtTemp(pt[2]),  // A相左外、A相中、A相右外
-      fmtTemp(pt[3]), fmtTemp(pt[4]), fmtTemp(pt[5]),  // B相左外、B相中、B相右外
-      fmtTemp(pt[6]), fmtTemp(pt[7]), fmtTemp(pt[8]),  // C相左外、C相中、C相右外
-      // 24-26: A/B/C相中内温度
-      fmtTemp(cores[0]), fmtTemp(cores[1]), fmtTemp(cores[2]), // A/B/C相中内
-      // 27-29: 状态、预警信息、故障信息
+      timeText,
+      now.millisecondsSinceEpoch.toString(),
+      d.nodeId.toString(),
+      '',
+      fmtTemp(upperTemp),
+      fmtTemp(middleTemp),
+      fmtTemp(lowerTemp),
+      fmtHumidity(humidityCorrected),
+      fmtCO(d.coPpm),
+      fmtH2(d.h2Percentage),
+      fmtPressure(d.pressureKpa),
+      fmtNum(d.smokeStatus),
+      fmtTemp(d.smokeExternalTempC),
+      fmtSmoke(whiteSmoke),
+      fmtSmoke(blackSmoke),
+      fmtTemp(pt[0]), fmtTemp(pt[1]), fmtTemp(pt[2]),
+      fmtTemp(pt[3]), fmtTemp(pt[4]), fmtTemp(pt[5]),
+      fmtTemp(pt[6]), fmtTemp(pt[7]), fmtTemp(pt[8]),
+      fmtTemp(cores[0]), fmtTemp(cores[1]), fmtTemp(cores[2]),
       status,
-      _escapeCsv(warnings),
-      _escapeCsv(faults),
+      _escapeCsv(warnings.isEmpty ? '无' : warnings.join(';')),
+      _escapeCsv(faults.isEmpty ? '无' : faults.join(';')),
     ];
     return row.join(',') + '\n';
   }
-  List<num?> _pt10(String? s) {
+
+  List<num?> _pt12(String? s) {
     try {
-      if (s == null || s.isEmpty) return List<num?>.filled(10, null);
+      if (s == null || s.isEmpty) return List<num?>.filled(12, null);
       final arr = (jsonDecode(s) as List).cast<num>();
-      final out = List<num?>.filled(10, null);
+      final out = List<num?>.filled(12, null);
       for (int i = 0; i < out.length && i < arr.length; i++) {
         out[i] = arr[i];
       }
       return out;
     } catch (_) {
-      return List<num?>.filled(10, null);
+      return List<num?>.filled(12, null);
     }
   }
 
@@ -557,24 +674,23 @@ class CsvLoggerService {
     try {
       final now = DateTime.now();
       final today = DateTime(now.year, now.month, now.day);
-      final dir = await _getNodeLogsDir(nodeId);
-      final name = _dateToName(today);
-      final file = File('${dir.path}${Platform.pathSeparator}$name.csv');
-      
-      if (await file.exists()) {
-        await file.delete();
-        // ignore: avoid_print
-        print('[CSV] deleted node today file: ${file.path}');
+      if (_logDirs.isEmpty) {
+        await _resolveLogDirs();
       }
-      
-      // 重置当前文件引用，下次访问时会重新创建
+      for (final base in _logDirs) {
+        for (final rel in _nodeCsvRelativeCandidates(nodeId, today)) {
+          final file = File('${base.path}${Platform.pathSeparator}$rel');
+          if (await file.exists()) {
+            await file.delete();
+            print('[CSV] deleted node today file: ${file.path}');
+          }
+        }
+      }
+
       _currentFileByNode[nodeId] = null;
       _currentDateByNode[nodeId] = null;
-      
-      // ignore: avoid_print
       print('[CSV] cleared node $nodeId today data');
     } catch (e) {
-      // ignore: avoid_print
       print('[CSV] error clearing node $nodeId today data: $e');
       rethrow;
     }
@@ -597,11 +713,9 @@ class CsvLoggerService {
     }
   }
 
-  // 读取指定节点某天CSV内容
   Future<File> ensureNodeFileForDate(int nodeId, DateTime date) async {
     final dir = await _getNodeLogsDir(nodeId);
-    final name = _dateToName(date);
-    final f = File('${dir.path}${Platform.pathSeparator}$name.csv');
+    final f = File('${dir.path}${Platform.pathSeparator}${_nodeCsvName(nodeId, date)}');
     if (!await f.exists()) {
       await f.create(recursive: true);
       await f.writeAsString(_buildHeaderLine(), mode: FileMode.write, flush: true, encoding: utf8);
@@ -609,28 +723,52 @@ class CsvLoggerService {
     return f;
   }
 
-  // 读取指定节点某天CSV数据
+  Future<File?> _findExistingNodeCsv(int nodeId, DateTime date) async {
+    if (_logDirs.isEmpty) {
+      await _resolveLogDirs();
+    }
+    for (final base in _logDirs) {
+      for (final rel in _nodeCsvRelativeCandidates(nodeId, date)) {
+        final f = File('${base.path}${Platform.pathSeparator}$rel');
+        if (await f.exists()) {
+          return f;
+        }
+      }
+    }
+    for (final base in _logDirs) {
+      final combined = File('${base.path}${Platform.pathSeparator}${_dateToName(date)}.csv');
+      if (await combined.exists()) {
+        return combined;
+      }
+    }
+    return null;
+  }
+
+  List<List<String>> _parseCsvText(String text, {required int onlyNodeId}) {
+    final lines = LineSplitter.split(text).toList();
+    if (lines.isEmpty) return <List<String>>[];
+    return lines.skip(1).map(_splitCsvLine).where((row) {
+      if (row.length < 3) return false;
+      return int.tryParse(row[2].trim()) == onlyNodeId;
+    }).toList();
+  }
+
+  // 读取指定节点某天CSV数据（新路径优先，兼容旧 node_08/日期.csv）
   Future<List<List<String>>> readNodeCsvByDate(int nodeId, DateTime date) async {
     try {
-      final f = await ensureNodeFileForDate(nodeId, date);
-      // 尝试以UTF-8编码读取文件
-      final text = await f.readAsString(encoding: utf8);
-      final lines = LineSplitter.split(text).toList();
-      if (lines.isEmpty) return <List<String>>[];
-      return lines.skip(1).map((l) => _splitCsvLine(l)).toList();
-    } catch (e) {
-      // 如果UTF-8读取失败，尝试其他编码
+      final f = await _findExistingNodeCsv(nodeId, date);
+      if (f == null) return <List<String>>[];
       try {
-        final f = await ensureNodeFileForDate(nodeId, date);
+        final text = await f.readAsString(encoding: utf8);
+        return _parseCsvText(text, onlyNodeId: nodeId);
+      } catch (_) {
         final bytes = await f.readAsBytes();
         final text = utf8.decode(bytes, allowMalformed: true);
-        final lines = LineSplitter.split(text).toList();
-        if (lines.isEmpty) return <List<String>>[];
-        return lines.skip(1).map((l) => _splitCsvLine(l)).toList();
-      } catch (e2) {
-        print('[CSV] 读取节点文件失败: $e2');
-        return <List<String>>[];
+        return _parseCsvText(text, onlyNodeId: nodeId);
       }
+    } catch (e) {
+      print('[CSV] 读取节点文件失败: $e');
+      return <List<String>>[];
     }
   }
 
@@ -692,40 +830,22 @@ class CsvLoggerService {
     }
   }
 
-  // 读取某天CSV内容（兼容旧接口）
+  // 读取某天CSV内容（兼容旧接口：分别确保节点8、9文件）
   Future<File> ensureFileForDate(DateTime date) async {
-    final dir = await _getLogsDir();
-    final name = _dateToName(date);
-    final f = File('${dir.path}${Platform.pathSeparator}$name.csv');
-    if (!await f.exists()) {
-      await f.create(recursive: true);
-      await f.writeAsString(_buildHeaderLine(), mode: FileMode.write, flush: true, encoding: utf8);
+    File? first;
+    for (final nodeId in const [8, 9]) {
+      final f = await ensureNodeFileForDate(nodeId, date);
+      first ??= f;
     }
-    return f;
+    return first!;
   }
 
   Future<List<List<String>>> readCsvByDate(DateTime date) async {
-    try {
-      final f = await ensureFileForDate(date);
-      // 尝试以UTF-8编码读取文件
-      final text = await f.readAsString(encoding: utf8);
-      final lines = LineSplitter.split(text).toList();
-      if (lines.isEmpty) return <List<String>>[];
-      return lines.skip(1).map((l) => _splitCsvLine(l)).toList();
-    } catch (e) {
-      // 如果UTF-8读取失败，尝试其他编码
-      try {
-        final f = await ensureFileForDate(date);
-        final bytes = await f.readAsBytes();
-        final text = utf8.decode(bytes, allowMalformed: true);
-        final lines = LineSplitter.split(text).toList();
-        if (lines.isEmpty) return <List<String>>[];
-        return lines.skip(1).map((l) => _splitCsvLine(l)).toList();
-      } catch (e2) {
-        print('[CSV] 读取文件失败: $e2');
-        return <List<String>>[];
-      }
+    final all = <List<String>>[];
+    for (final nodeId in const [8, 9]) {
+      all.addAll(await readNodeCsvByDate(nodeId, date));
     }
+    return all;
   }
 
   List<String> _splitCsvLine(String line) {
@@ -770,7 +890,7 @@ class CsvLoggerService {
 
   // 计算完整的历史数据
   Future<Map<String, dynamic>> _computeFullHistoryData(SensorData data) async {
-    final pt = _pt10(data.pt100Temperatures);
+    final pt = _pt12(data.pt100Temperatures);
     final cores = _computePhaseCores(pt, data.temperature, data.pressureTempC);
 
     final nodeData = _sensorDataToNodeData(data);
@@ -831,43 +951,38 @@ class CsvLoggerService {
     return fullHistoryData;
   }
 
-  // 保存数据传输日志（发送指令和接收数据）
-  Future<void> saveDataTransferLog(int nodeId, String direction, List<int> data, DateTime timestamp) async {
+  // 保存数据传输日志（发送指令和接收完整帧），与传感器CSV写到同一批节点目录
+  void saveDataTransferLog(int nodeId, String direction, List<int> data, DateTime timestamp) {
+    if (nodeId != 8 && nodeId != 9) return;
+    if (data.isEmpty) return;
+    _rawWriteChain = _rawWriteChain.then((_) => _writeDataTransferLog(nodeId, direction, data, timestamp)).catchError((e) {
+      print('[CSV] 收发记录写入链失败: $e');
+    });
+  }
+
+  Future<void> _writeDataTransferLog(
+    int nodeId,
+    String direction,
+    List<int> data,
+    DateTime timestamp,
+  ) async {
     try {
-      if (data.isEmpty) {
-        // 如果数据为空，跳过保存
-        return;
-      }
-      
-      // 获取日志文件路径（在CSV文件名后加_raw后缀）
-      final now = timestamp;
-      final today = DateTime(now.year, now.month, now.day);
-      final dir = await _getNodeLogsDir(nodeId);
-      final name = _dateToName(today);
-      final logFile = File('${dir.path}${Platform.pathSeparator}${name}_raw.csv');
-      
-      // 如果文件不存在，创建文件并写入表头
-      if (!await logFile.exists()) {
-        await logFile.create(recursive: true);
-        // 表头：时间,毫秒时间戳,节点,方向,十六进制数据
-        final header = 'time,epoch_ms,node_id,direction,hex_data\n';
-        await logFile.writeAsString(header, mode: FileMode.write, flush: true, encoding: utf8);
-      }
-      
-      // 将原始数据转换为十六进制字符串
-      final hexData = data.map((byte) => byte.toRadixString(16).padLeft(2, '0').toUpperCase()).join(' ');
-      
-      // 格式化时间
+      final today = DateTime(timestamp.year, timestamp.month, timestamp.day);
+      final files = await _allNodeRawFiles(nodeId, today);
+      if (files.isEmpty) return;
       String to2(int n) => n < 10 ? '0$n' : '$n';
-      final timeText = '${now.year}-${to2(now.month)}-${to2(now.day)} ${to2(now.hour)}:${to2(now.minute)}:${to2(now.second)}';
-      
-      // 写入数据行：时间,毫秒时间戳,节点,方向(发送/接收),十六进制数据
-      final line = '$timeText,${now.millisecondsSinceEpoch},$nodeId,$direction,"$hexData"\n';
-      await logFile.writeAsString(line, mode: FileMode.append, flush: true, encoding: utf8);
-      
-      print('[CSV] 保存数据传输日志 - 节点:$nodeId 方向:$direction 时间:${now.toIso8601String()} 长度:${data.length}字节');
+      final timeText =
+          '${timestamp.year}-${to2(timestamp.month)}-${to2(timestamp.day)} ${to2(timestamp.hour)}:${to2(timestamp.minute)}:${to2(timestamp.second)}';
+      final hexData = data
+          .map((byte) => byte.toRadixString(16).padLeft(2, '0').toUpperCase())
+          .join(' ');
+      final line =
+          '$timeText,${timestamp.millisecondsSinceEpoch},$nodeId,$direction,"$hexData"\n';
+      for (final file in files) {
+        await file.writeAsString(line, mode: FileMode.append, flush: false, encoding: utf8);
+      }
     } catch (e) {
-      print('[CSV] 保存数据传输日志失败: $e');
+      print('[CSV] 保存收发记录失败: $e');
     }
   }
 

@@ -12,10 +12,11 @@ class NodeDataCalculator {
   /// 计算节点显示数据（与页面显示完全一致）
   /// 返回一个Map，包含所有页面显示的数据
   Future<Map<String, dynamic>> calculateDisplayData(SensorData data) async {
-    // 获取节点设置
-    final settings = SettingsService();
-    final nodeSettings = await settings.getAllSettingsForNode(data.nodeId);
-    
+    final nodeSettings = await SettingsService().getAllSettingsForNode(data.nodeId);
+    return calculateDisplayDataSync(data, nodeSettings);
+  }
+
+  Map<String, dynamic> calculateDisplayDataSync(SensorData data, Map<String, dynamic> nodeSettings) {
     final upperCorr = nodeSettings['upperTempCorrection'] as double? ?? 0.0;
     final middleCorr = nodeSettings['envTempCorrection'] as double? ?? 0.0;
     final lowerCorr = nodeSettings['lowerTempCorrection'] as double? ?? 0.0;
@@ -107,6 +108,11 @@ class NodeDataCalculator {
       phaseTemps['A'] = [aL, aM, aR, aMInner];
       phaseTemps['B'] = [bL, bM, bR, bMInner];
       phaseTemps['C'] = [cL, cM, cR, cMInner];
+      phaseTemps['cable18'] = [
+        aL, aLInner, aM, aMInner, aR, aRInner,
+        bL, bLInner, bM, bMInner, bR, bRInner,
+        cL, cLInner, cM, cMInner, cR, cRInner,
+      ];
     }
     
     // 计算烟雾浓度（与页面逻辑完全一致）
@@ -161,6 +167,7 @@ class NodeDataCalculator {
       'phaseA': phaseTemps['A'] ?? [-999.0, -999.0, -999.0, -999.0],
       'phaseB': phaseTemps['B'] ?? [-999.0, -999.0, -999.0, -999.0],
       'phaseC': phaseTemps['C'] ?? [-999.0, -999.0, -999.0, -999.0],
+      'cableTemps18': phaseTemps['cable18'] ?? List<double>.filled(18, -999.0),
       
       // 原始PT100数据（已应用修正）
       'pt100Corrected': correctedTemps,
