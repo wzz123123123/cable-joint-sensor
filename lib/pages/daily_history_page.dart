@@ -528,7 +528,7 @@ class _DailyHistoryPageState extends State<DailyHistoryPage> {
                               itemCount: _filteredRows().length,
                               itemBuilder: (context, index) {
                                 final r = _filteredRows()[index];
-                                final status = r.length > 25 ? r[25] : '';
+                                final status = r.length > 27 ? r[27] : '';
                                 final bg = _statusBg(status);
                                 return Container(
                                   decoration: BoxDecoration(
@@ -591,7 +591,7 @@ class _DailyHistoryPageState extends State<DailyHistoryPage> {
     
     // 状态过滤
     if (_statusFilter != '全部') {
-      rows = rows.where((r) => r.length > 25 && r[25] == _statusFilter).toList();
+      rows = rows.where((r) => r.length > 27 && r[27] == _statusFilter).toList();
     }
     // 传感器类型过滤：按对应列是否有值，而非严格匹配类型列
     if (_sensorTypeFilter != '全部') {

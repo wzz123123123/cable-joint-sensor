@@ -121,13 +121,7 @@ class _DataDetailPageState extends State<DataDetailPage> {
     setState(() {
       final humidityCorr = (nodeSettings['humidityCorrection'] as double? ?? 0.0);
       final rawHumidity = currentNode.humidity ?? 45;
-      // 获取湿度历史正常值（如果当前值异常）
-      final humidityHistoryValue = sensorProvider.getHumidityHistoryValue(widget.nodeId, rawHumidity);
-      final validHumidity = humidityHistoryValue ?? rawHumidity;
-      if (humidityHistoryValue != null) {
-        print('湿度异常值替换: 节点=${widget.nodeId}, 异常值=$rawHumidity, 使用历史值=$humidityHistoryValue');
-      }
-      final correctedHumidity = (validHumidity + humidityCorr).clamp(0, 100);
+      final correctedHumidity = (rawHumidity + humidityCorr).clamp(0, 100);
       humidity = correctedHumidity.toDouble();
       pressure = currentNode.pressureKpa ?? 100;
       h2Concentration = currentNode.h2Percentage ?? 0;
@@ -142,27 +136,10 @@ class _DataDetailPageState extends State<DataDetailPage> {
       }
       smokeRatio = currentNode.smokeRatio ?? 0;
       
-      // 辅助函数：获取环境温度值，如果异常则使用历史正常值
-      double getValidTempForEnv(int channelIndex, double currentValue, double defaultTemp) {
-        // 检查是否异常（超出合理范围，去掉上限）
-        if (currentValue < -50 || currentValue == -999) {
-          // 尝试获取历史正常值
-          final historyValue = sensorProvider.getTempHistoryValue(widget.nodeId, channelIndex, currentValue);
-          if (historyValue != null) {
-            print('环境温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用历史值=$historyValue');
-            return historyValue;
-          }
-          // 没有历史值，使用默认温度
-          return defaultTemp;
-        }
-        return currentValue;
-      }
-      
       // 使用PT100通道11作为中温度，温湿度传感器温度作为下温度
       if (currentNode.pt100Temperatures != null && currentNode.pt100Temperatures!.length >= 12) {
         final pt11Temp = currentNode.pt100Temperatures![11];
-        final validPt11Temp = getValidTempForEnv(11, pt11Temp, (currentNode.temperature ?? 25).toDouble());
-        middleTemp = (validPt11Temp != -999) ? validPt11Temp + middleCorr : (currentNode.temperature ?? 25) + middleCorr;
+        middleTemp = (pt11Temp != -999) ? pt11Temp + middleCorr : (currentNode.temperature ?? 25) + middleCorr;
       } else {
         middleTemp = (currentNode.temperature ?? 25) + middleCorr; // 备用：温湿度传感器温度
       }
@@ -216,56 +193,28 @@ class _DataDetailPageState extends State<DataDetailPage> {
         print('Processing PT100 data: $temps');
         print('PT100 corrections: $_pt100Corrections');
         print('PT100 corrected: $corrected');
+        // A: ch1,ch2,ch3
+        final aL = corrected[0];
+        final aM = corrected[1];
+        final aR = corrected[2];
         
-        // 辅助函数：获取温度值，如果异常则使用历史正常值
-        double getValidTemp(int channelIndex, double currentValue) {
-          // 检查是否异常（超出合理范围，去掉上限）
-          if (currentValue < -50 || currentValue == -999) {
-            // 尝试获取历史正常值
-            final historyValue = sensorProvider.getTempHistoryValue(widget.nodeId, channelIndex, currentValue);
-            if (historyValue != null) {
-              print('温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用历史值=$historyValue');
-              return historyValue;
-            }
-            // 没有历史值，使用默认值25°C（但保持开路标记）
-            if (currentValue == -999) return -999;
-            print('温度异常值替换: 节点=${widget.nodeId}, 通道=$channelIndex, 异常值=$currentValue, 使用默认值25.0');
-            return 25.0;
-          }
-          return currentValue;
-        }
+        // B: ch4,ch5,ch6
+        final bL = corrected[3];
+        final bM = corrected[4];
+        final bR = corrected[5];
         
-        // A: ch1,ch2,ch3 - 使用有效温度值（异常时使用历史值）
-        final aL = getValidTemp(0, corrected[0]);
-        final aM = getValidTemp(1, corrected[1]);
-        final aR = getValidTemp(2, corrected[2]);
-        
-        // B: ch4,ch5,ch6 - 使用有效温度值（异常时使用历史值）
-        final bL = getValidTemp(3, corrected[3]);
-        final bM = getValidTemp(4, corrected[4]);
-        final bR = getValidTemp(5, corrected[5]);
-        
-        // C: ch7,ch8,ch9 - 使用有效温度值（异常时使用历史值）
-        final cL = getValidTemp(6, corrected[6]);
-        final cM = getValidTemp(7, corrected[7]);
-        final cR = getValidTemp(8, corrected[8]);
+        // C: ch7,ch8,ch9
+        final cL = corrected[6];
+        final cM = corrected[7];
+        final cR = corrected[8];
         
         // 计算内温度：Y = xi + 6.42（xi – x0i）+（xi-xia）*2.5
         // xi: 外测点温度, x0i: 环境温度, xia: 三相平均值
         
-        // 计算三相平均值（使用有效温度值，排除开路值）
-        double calculateAvg(double val1, double val2, double val3) {
-          int count = 0;
-          double sum = 0;
-          if (val1 != -999) { sum += val1; count++; }
-          if (val2 != -999) { sum += val2; count++; }
-          if (val3 != -999) { sum += val3; count++; }
-          return count > 0 ? sum / count : 25.0; // 如果都是开路，使用默认值
-        }
-        
-        final leftAvg = calculateAvg(aL, bL, cL);   // 左外温度平均值
-        final middleAvg = calculateAvg(aM, bM, cM); // 中外温度平均值  
-        final rightAvg = calculateAvg(aR, bR, cR);  // 右外温度平均值
+        // 计算三相平均值
+        final leftAvg = (aL + bL + cL) / 3;   // 左外温度平均值
+        final middleAvg = (aM + bM + cM) / 3; // 中外温度平均值  
+        final rightAvg = (aR + bR + cR) / 3;  // 右外温度平均值
         
         // 获取节点特定的k1、k2参数
         final aK1 = nodeSettings['aK1'] as double? ?? 6.42;
@@ -294,16 +243,11 @@ class _DataDetailPageState extends State<DataDetailPage> {
         phaseATemps = [aL, aLInner, aM, aMInner, aR, aRInner];
         phaseBTemps = [bL, bLInner, bM, bMInner, bR, bRInner];
         phaseCTemps = [cL, cLInner, cM, cMInner, cR, cRInner];
-        // 上温度（叠加修正）：节点1使用通道10，其他节点使用通道9
-        // 使用有效温度值（异常时使用历史值）
-        if (widget.nodeId == 1) {
-          // 节点1使用通道10
-          final validUpperTemp = getValidTemp(10, corrected.length >= 11 ? corrected[10] : 25.0);
-          upperTemp = (validUpperTemp != -999) ? validUpperTemp + upperCorr : 25 + upperCorr;
+        // 第10通道为上温度（叠加修正）
+        if (currentNode.pt100Temperatures!.length >= 10) {
+          upperTemp = corrected[9] + upperCorr;
         } else {
-          // 其他节点使用通道9
-          final validUpperTemp = getValidTemp(9, corrected[9]);
-          upperTemp = (validUpperTemp != -999) ? validUpperTemp + upperCorr : 25 + upperCorr;
+          upperTemp = 25 + upperCorr; // 默认值
         }
 
         print('Phase A temps: $phaseATemps');

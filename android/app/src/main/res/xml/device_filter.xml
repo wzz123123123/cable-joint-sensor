@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 匹配所有 USB 串口芯片，避免漏掉平板转接线 -->
+    <usb-device />
+    <!-- CH340 / CH341 -->
+    <usb-device vendor-id="6790" product-id="29987" />
+    <usb-device vendor-id="6790" product-id="21795" />
+    <usb-device vendor-id="6790" product-id="29986" />
+    <!-- CH9102 / CH343 -->
+    <usb-device vendor-id="6790" product-id="21972" />
+    <usb-device vendor-id="6790" product-id="21971" />
+    <!-- CP210x -->
+    <usb-device vendor-id="4292" product-id="60000" />
+    <usb-device vendor-id="4292" product-id="60016" />
+    <!-- FTDI -->
+    <usb-device vendor-id="1027" product-id="24577" />
+    <usb-device vendor-id="1027" product-id="24592" />
+    <usb-device vendor-id="1027" product-id="24593" />
+    <!-- PL2303 -->
+    <usb-device vendor-id="1659" product-id="8963" />
+    <!-- CDC ACM 常见板卡 -->
+    <usb-device vendor-id="9025" />
+    <usb-device vendor-id="5824" />
+    <usb-device vendor-id="1155" />
+</resources>

@@ -9,8 +9,8 @@ class HistorySearchPage extends StatefulWidget {
 }
 
 class _HistorySearchPageState extends State<HistorySearchPage> {
-  final List<String> _nodeOptions = const ['08', '09'];
-  String _selectedNode = '08';
+  final List<String> _nodeOptions = const ['06', '07'];
+  String _selectedNode = '06';
   // 参数key，例如 upper_temp、middle_temp 等
   String _selectedSensorType = 'upper_temp';
   DateTime _startDate = DateTime.now();
@@ -204,7 +204,7 @@ class _HistorySearchPageState extends State<HistorySearchPage> {
 
   void _reset() {
     setState(() {
-      _selectedNode = '08';
+      _selectedNode = '06';
       _selectedSensorType = 'upper_temp';
       _startDate = DateTime.now();
       _endDate = DateTime.now();

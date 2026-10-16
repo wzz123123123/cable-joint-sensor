@@ -273,16 +273,6 @@ class SensorProvider with ChangeNotifier {
   // 获取网络连接状态
   bool get isNetworkConnected => _sensorService.isNetworkConnected();
 
-  // 获取温度历史正常值（用于节点详细页面计算）
-  double? getTempHistoryValue(int nodeId, int channelIndex, double currentValue) {
-    return _sensorService.getTempHistoryValue(nodeId, channelIndex, currentValue);
-  }
-
-  // 获取湿度历史正常值（用于节点详细页面计算）
-  double? getHumidityHistoryValue(int nodeId, double currentValue) {
-    return _sensorService.getHumidityHistoryValue(nodeId, currentValue);
-  }
-
   // 清理资源
   void dispose() {
     _sensorService.stopReceiving();

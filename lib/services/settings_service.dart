@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:io';
 
 class SettingsService {
   static final SettingsService _instance = SettingsService._internal();
@@ -87,7 +87,7 @@ class SettingsService {
   // 初始化设置
   Future<void> initialize() async {
     final prefs = await SharedPreferences.getInstance();
-    // 如果本地首启为空（例如重装），尝试从外部备份恢复
+    // 如果是重新安装导致的 SharedPreferences 被清空，则尝试从外部存储备份恢复
     await _restorePrefsFromExternalIfEmpty(prefs);
     
     _tempStart = prefs.getDouble('temp_start') ?? DEFAULT_TEMP_START;
@@ -441,6 +441,7 @@ class SettingsService {
         } else if (value is String) {
           await prefs.setString(key, value);
         } else if (value is List) {
+          // SharedPreferences 不直接支持List，存储时已序列化，这里也按字符串处理
           await prefs.setString(key, jsonEncode(value));
         }
       }

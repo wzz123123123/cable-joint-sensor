@@ -6,6 +6,8 @@ import '../models/node_data.dart';
 import '../services/alert_service.dart';
 import '../services/password_service.dart';
 import '../services/settings_service.dart';
+import '../services/serial_debug_logger.dart';
+import '../services/csv_logger_service.dart';
 import 'data_detail_page.dart';
 import 'daily_history_page.dart';
 
@@ -382,6 +384,16 @@ class _IndexPageState extends State<IndexPage> {
                           ),
                         ),
                       ],
+                    ),
+                  ),
+
+                  Container(
+                    width: double.infinity,
+                    color: const Color(0xFF5D4037),
+                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                    child: SelectableText(
+                      '版本1.0.22 固定/dev/ttyS7    串口: ${sensorProvider.connectionStatus}    数据记录: ${CsvLoggerService.instance.displayPath ?? "初始化中"}    调试日志: ${SerialDebugLogger.instance.displayPath ?? "初始化中"}',
+                      style: const TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ),
                   

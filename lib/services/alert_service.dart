@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../models/node_data.dart';
 import 'settings_service.dart';
 import 'ignore_service.dart';
@@ -826,8 +828,7 @@ class AlertService {
   // 启动Modbus TCP连接（兼容性方法）
   void startModbusConnection() {
     print('AlertService Modbus连接已启动');
-    // 这个方法是为了兼容sensor_flutter5项目而添加的
-    // 在sensor_flutter项目中，AlertService不需要独立的Modbus连接
+    _modbusClient.startConnectionMonitoring();
   }
   
   /// 发送预警/故障485格式报文
@@ -896,9 +897,13 @@ class AlertService {
         data.add(0x00);
         data.add(0x00);
       }
-      
-      // 不再主动发送预警/故障，等待客户端请求时返回状态
-      print('⚠️ 检测到${isWarning ? '预警' : '故障'}: 节点=${nodeData.nodeId}, 故障码=0x${faultCode.toRadixString(16)}, 描述=$alertDescription');
+
+      unawaited(_modbusClient.sendRS485Frame(
+        nodeId: nodeData.nodeId,
+        sensorId: faultCode,
+        data: data,
+      ));
+      print('📤 ${isWarning ? '预警' : '故障'}已上报: 节点=${nodeData.nodeId}, 故障码=0x${faultCode.toRadixString(16)}, 描述=$alertDescription');
     } catch (e) {
       print('❌ 发送预警/故障485报文失败: $e');
     }

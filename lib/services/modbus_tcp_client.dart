@@ -18,6 +18,7 @@ class ModbusTcpClient {
   bool _isConnected = false;
   Timer? _connectionCheckTimer;
   int _transactionId = 0x0001; // 事务ID计数器，递增使用
+  Future<void> _sendChain = Future.value();
 
   /// 发送节点连接状态变化通知
   Future<bool> sendNodeConnectionChange({
@@ -126,23 +127,9 @@ class ModbusTcpClient {
         calculateCRC16: calculateCRC16,
       );
       
-      // 将485帧封装到Modbus TCP帧中发送
       final targetUnitId = nodeId.clamp(1, 9);
       final modbusFrame = _createModbusTcpFrame(rs485Frame, unitId: targetUnitId);
-      
-      if (_socket == null || !_isConnected) {
-        print('连接不存在，尝试建立新连接...');
-        final connected = await _connect();
-        if (!connected) {
-          print('Modbus TCP连接失败，跳过485帧发送');
-          return false;
-        }
-      }
-      
-      _socket!.add(modbusFrame);
-      await _socket!.flush();
-      print('📤 485格式数据发送成功: 节点=$nodeId, 传感器=$sensorId, 数据长度=${data.length}');
-      return true;
+      return await _writeFrame(modbusFrame, '485帧 节点=$nodeId 传感器=0x${sensorId.toRadixString(16)}');
     } catch (e) {
       print('❌ 485格式数据发送失败: $e');
       _isConnected = false;
@@ -176,31 +163,39 @@ class ModbusTcpClient {
         payload[1 + i] = jsonBytes[i];
       }
       
-      // 创建Modbus TCP帧（标准结构）
       final modbusFrame = _createModbusTcpFrame(payload, unitId: targetUnitId);
-      
-      // 检查连接状态，只有在必要时才重新连接
-      if (_socket == null || !_isConnected) {
-        print('连接不存在，尝试建立新连接...');
-        final connected = await _connect();
-        if (!connected) {
-          print('Modbus TCP连接失败，跳过数据发送: ${jsonData['type']}');
-          return false;
-        }
-      }
-      
-      // 发送数据
-      _socket!.add(modbusFrame);
-      await _socket!.flush();
-      
-      print('Modbus TCP数据发送成功: ${jsonData['type']}');
-      return true;
+      return await _writeFrame(modbusFrame, 'JSON ${jsonData['type']} 节点=$targetUnitId');
     } catch (e) {
       print('Modbus TCP数据发送失败: $e');
-      // 标记连接为断开，但不立即关闭socket，让监控机制处理重连
       _isConnected = false;
       return false;
     }
+  }
+
+  Future<bool> _writeFrame(Uint8List frame, String label) {
+    final done = Completer<bool>();
+    _sendChain = _sendChain.then((_) async {
+      try {
+        if (_socket == null || !_isConnected) {
+          print('连接不存在，尝试建立新连接...');
+          final connected = await _connect();
+          if (!connected) {
+            print('Modbus TCP连接失败，跳过发送: $label');
+            done.complete(false);
+            return;
+          }
+        }
+        _socket!.add(frame);
+        await _socket!.flush();
+        print('📤 上传成功: $label ${frame.length}字节 → $_serverHost:$_serverPort');
+        done.complete(true);
+      } catch (e) {
+        print('❌ 上传失败: $label $e');
+        _isConnected = false;
+        if (!done.isCompleted) done.complete(false);
+      }
+    });
+    return done.future;
   }
 
   /// 建立长连接
